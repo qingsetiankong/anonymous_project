@@ -1,0 +1,15 @@
+env:
+  name: CartPole-v0
+
+train:
+  actor_lr: 0.001
+  critic_lr: 0.01
+  gamma: 0.98
+  gpus: 0  # -1==cpu
+  num_episodes: 1000
+  seed: 0
+
+model:
+  actor_layers: [128,128,128]
+  critic_layers: [128,128,128]
+  #actions_dim: 12

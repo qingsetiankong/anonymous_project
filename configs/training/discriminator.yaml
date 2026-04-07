@@ -1,0 +1,6 @@
+model:
+  hidden_layers: [512,256]
+
+optimizer:
+  name: Adam
+  lr: 0.001
