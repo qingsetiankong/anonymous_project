@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-import rl_utils 
+from rl import rl_utils
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dims, output_dim, output_activation=None):
@@ -15,6 +15,10 @@ class MLP(nn.Module):
             hidden_dims = [hidden_dims]
         if hidden_dims is None:
             hidden_dims = []
+        else:
+            # 兼容 tuple / 其它可迭代类型，避免 `[input_dim] + hidden_dims`
+            # 在 `hidden_dims` 不是 list 时触发类型错误。
+            hidden_dims = list(hidden_dims)
         
         layer_dims = [input_dim] + hidden_dims + [output_dim]
         

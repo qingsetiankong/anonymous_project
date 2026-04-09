@@ -6,6 +6,22 @@ from typing import Any
 import numpy as np
 
 
+def _to_numpy(value: Any, dtype=np.float32) -> np.ndarray:
+    """
+    将 torch / numpy / Python 标量统一整理为 numpy 数组。
+
+    说明:
+    - rollout_buffer.extract_episodes() 当前返回的是张量列表
+    - 其中很多元素仍然位于 GPU 上
+    - 因此这里必须先 `detach().cpu()`，再交给 `np.asarray`
+    """
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    return np.asarray(value, dtype=dtype)
+
+
 @dataclass
 class EpisodeTrajectory:
     """
@@ -76,7 +92,7 @@ class TrajectorySelector:
         """
         将轨迹序列统一转换为 shape = [T, D] 的二维数组。
         """
-        array = np.asarray([np.asarray(item, dtype=np.float32).reshape(-1) for item in sequence], dtype=np.float32)
+        array = np.asarray([_to_numpy(item, dtype=np.float32).reshape(-1) for item in sequence], dtype=np.float32)
         if array.ndim != 2:
             raise ValueError("轨迹序列必须能转换成二维数组 [T, D]")
         return array
@@ -89,7 +105,7 @@ class TrajectorySelector:
         用于和采样轨迹做 DTW 匹配。
         """
         trajectory_length = max(int(trajectory_length), 1)
-        target_pose = np.asarray(target_pose, dtype=np.float32).reshape(1, -1)
+        target_pose = _to_numpy(target_pose, dtype=np.float32).reshape(1, -1)
         return np.repeat(target_pose, trajectory_length, axis=0)
 
     def dtw_distance(self, sequence_a, sequence_b) -> float:
@@ -123,7 +139,7 @@ class TrajectorySelector:
         """
         if not trajectory.task_rewards:
             return 0.0
-        return float(np.sum(np.asarray(trajectory.task_rewards, dtype=np.float32)))
+        return float(np.sum(_to_numpy(trajectory.task_rewards, dtype=np.float32)))
 
     def assessment_score(self, trajectory: EpisodeTrajectory, target_pose) -> tuple[float, float, float]:
         """
@@ -179,13 +195,15 @@ class TrajectorySelector:
         if "skill_ids" not in episode or not episode["skill_ids"]:
             raise KeyError("episode 中缺少 skill_ids，无法构造 EpisodeTrajectory")
 
-        skill_id = int(np.asarray(episode["skill_ids"][0]).reshape(-1)[0])
+        skill_id = int(_to_numpy(episode["skill_ids"][0], dtype=np.int64).reshape(-1)[0])
         return EpisodeTrajectory(
             skill_id=skill_id,
             observations=list(episode.get("obs", [])),
             imitation_observations=list(episode.get("imitation_obs", [])),
-            task_rewards=[float(np.asarray(item).reshape(-1)[0]) for item in episode.get("reward_task", [])],
-            regularization_rewards=[float(np.asarray(item).reshape(-1)[0]) for item in episode.get("reward_reg", [])],
-            total_rewards=[float(np.asarray(item).reshape(-1)[0]) for item in episode.get("reward_total", [])],
+            task_rewards=[float(_to_numpy(item, dtype=np.float32).reshape(-1)[0]) for item in episode.get("reward_task", [])],
+            regularization_rewards=[
+                float(_to_numpy(item, dtype=np.float32).reshape(-1)[0]) for item in episode.get("reward_reg", [])
+            ],
+            total_rewards=[float(_to_numpy(item, dtype=np.float32).reshape(-1)[0]) for item in episode.get("reward_total", [])],
             actions=list(episode.get("actions", [])),
         )

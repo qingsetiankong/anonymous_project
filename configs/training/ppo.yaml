@@ -1,0 +1,47 @@
+ppo:
+  num_steps: 128 #int
+  ppo_epochs: 1000 #int
+  mini_batch_size: 256 #int
+  clip_epsilon: 0.2 #float
+  gamma: 0.99 #float
+  gae_lambda: 0.95 #float
+  actor_lr: 3.0e-4 #float
+  critic_lr: 1.0e-3 #float
+  max_grad_norm: 1.0 #float
+  value_loss_coef: 0.5 #float
+  entropy_coef: 0.0 #float
+  device: "cpu" #str
+
+  # policy / value 网络结构
+  actor_hidden_dims: (128, 128, 128) #tuple[int, ...]
+  critic_hidden_dims: (128, 128, 128) #tuple[int, ...]
+  init_log_std: -0.5 #float
+
+  # task reward 相关超参数
+  pose_weight: 1.0 #float
+  velocity_weight: 0.0 #float
+  command_weight: 0.0 #float
+  pose_sigma: 1.0 #float
+  velocity_sigma: 0.25 #float
+
+  # regularization reward 相关超参数
+  action_weight: 1.0e-3 #float
+  smoothness_weight: 1.0e-3 #float
+  stability_weight: 0.0 #float
+
+  # total reward 动态权重相关超参数
+  sigma_t: 0.5 #float
+  sigma_sil: 0.5 #float
+  omega_r: 1.0 #float
+
+  # PASIST / SIL 可选开关
+  enable_sil: False #bool
+  use_skill_selector: False #bool
+  discriminator_config_path: "configs/training/discriminator.yaml" #str
+  discriminator_batch_size: 256 #int
+  discriminator_updates_per_iteration: 1 #int
+  sil_buffer_capacity_per_skill: 8 #int
+  trajectory_dtw_weight: 0.1 #float
+
+seed:
+  seed: 0 #int

@@ -1,6 +1,23 @@
 model:
-  hidden_layers: [512,256]
+  # 判别器主干网络结构。
+  # 这里会直接传给 rl.actor_critic_new.MLP 的 hidden_dims 参数。
+  hidden_layers: [512, 256]
 
 optimizer:
+  # PyTorch 优化器类名，例如 Adam / AdamW / SGD。
   name: Adam
+  # 学习率。
   lr: 0.001
+  # 可选；如果不需要可以保留 0。
+  weight_decay: 0.0
+
+loss:
+  # expert 样本梯度惩罚权重。
+  gradient_penalty_weight: 10.0 
+  # expert / SIL buffer 样本希望逼近的分数。
+  expert_target: 1.0
+  # 当前 policy 样本希望逼近的分数。
+  policy_target: -1.0
+
+seed:
+  seed: 0 #int

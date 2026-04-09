@@ -1,0 +1,6 @@
+ppo_cnfig_path:
+  PPOTrainer_config_path: configs/training/ppo_trainer.yaml
+
+
+discriminator_config_path:
+  Discriminator_config_path: configs/training/discriminator.yaml

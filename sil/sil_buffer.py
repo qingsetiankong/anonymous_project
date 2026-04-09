@@ -6,6 +6,21 @@ from typing import Any
 import numpy as np
 
 
+def _to_numpy(value: Any, dtype=np.float32) -> np.ndarray:
+    """
+    将 torch / numpy / Python 标量统一整理为 numpy 数组。
+
+    说明:
+    - extract_episodes() 返回的 episode 元素通常是 torch.Tensor
+    - 为了兼容 GPU rollout buffer，这里需要先移动到 CPU
+    """
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    return np.asarray(value, dtype=dtype)
+
+
 @dataclass
 class SILTrajectory:
     """
@@ -16,7 +31,7 @@ class SILTrajectory:
     - assessment_score: 轨迹质量分数，通常由 task reward + DTW 共同决定
     - imitation_observations: 用于判别器训练的模仿观测序列
     - trajectory: 原始轨迹附加信息，保留给后续分析或调试
-    - metadata: 补充元数据，例如 command、episode_id、长度等
+    - metadata: 补充元数据，例如 command、episode_id、长度、dtw_distance 等
     """
 
     skill_id: int
@@ -130,12 +145,9 @@ class SILBuffer:
         if skill_id is None:
             if "skill_ids" not in episode or not episode["skill_ids"]:
                 raise KeyError("无法从 episode 中推断 skill_id，请显式传入")
-            skill_id = int(np.asarray(episode["skill_ids"][0]).reshape(-1)[0])
+            skill_id = int(_to_numpy(episode["skill_ids"][0], dtype=np.int64).reshape(-1)[0])
 
-        imitation_observations = np.asarray(
-            [np.asarray(item, dtype=np.float32).reshape(-1) for item in episode[imitation_key]],
-            dtype=np.float32,
-        )
+        imitation_observations = np.asarray([_to_numpy(item, dtype=np.float32).reshape(-1) for item in episode[imitation_key]], dtype=np.float32)
 
         return self.add(
             skill_id=skill_id,
@@ -184,16 +196,36 @@ class SILBuffer:
     def summary(self) -> dict[int, dict[str, float]]:
         """
         返回按 skill 聚合的统计摘要，便于训练日志使用。
+
+        如果每条轨迹的 `metadata` 中包含 `dtw_distance`，
+        这里还会额外给出：
+        - `mean_dtw`
+        - `min_dtw`
+        - `max_dtw`
+
+        这样 `rewards.compute_mean_sil_dtw()` 就能真正读取 DTW 统计，
+        而不是再用 score 去冒充 DTW。
         """
         result: dict[int, dict[str, float]] = {}
         for skill_id, bucket in self._storage.items():
             scores = np.asarray([entry.assessment_score for entry in bucket], dtype=np.float32)
             lengths = np.asarray([entry.length for entry in bucket], dtype=np.float32)
-            result[int(skill_id)] = {
+            summary = {
                 "count": float(len(bucket)),
                 "mean_score": float(scores.mean()) if len(scores) else 0.0,
                 "max_score": float(scores.max()) if len(scores) else 0.0,
                 "min_score": float(scores.min()) if len(scores) else 0.0,
                 "mean_length": float(lengths.mean()) if len(lengths) else 0.0,
             }
+            dtw_values = [
+                float(entry.metadata["dtw_distance"])
+                for entry in bucket
+                if isinstance(entry.metadata, dict) and "dtw_distance" in entry.metadata
+            ]
+            if dtw_values:
+                dtw_array = np.asarray(dtw_values, dtype=np.float32)
+                summary["mean_dtw"] = float(dtw_array.mean())
+                summary["min_dtw"] = float(dtw_array.min())
+                summary["max_dtw"] = float(dtw_array.max())
+            result[int(skill_id)] = summary
         return result

@@ -300,7 +300,15 @@ class BasePasistEnv(ABC):
             "skill_name": command.skill_name,
             "target_pose": self.get_target_pose(command.skill_id).copy(),
             "imitation_obs": self.extract_imitation_observation(observation).copy(),
-            "measured_velocity": None if measured_velocity is None else float(measured_velocity),
+            "measured_velocity": (
+                None
+                if measured_velocity is None
+                else (
+                    float(measured_velocity)
+                    if np.asarray(measured_velocity).ndim == 0
+                    else np.asarray(measured_velocity, dtype=np.float32).copy()
+                )
+            ),
         }
         if extra:
             info.update(extra)
