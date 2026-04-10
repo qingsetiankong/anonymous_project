@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
+import pathlib
 
 import gymnasium as gym
 import isaaclab.sim as sim_utils
+import numpy as np
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -51,6 +53,61 @@ PASIST 专用 Isaac Lab 环境配置。
 
 
 TASK_ID = "PASIST-Go2-Base"
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+INIT_POSE_PATH = PROJECT_ROOT / "init_pose" / "init_pose.npy"
+
+# 这里的顺序必须与 Go2 的 12 个关节顺序保持一致。
+# 按照 unitree_rl_lab 中 `UNITREE_GO2_CFG.joint_sdk_names` 的定义，顺序为：
+# FR -> FL -> RR -> RL，每条腿依次是 hip / thigh / calf。
+GO2_JOINT_ORDER = (
+    "FR_hip_joint",
+    "FR_thigh_joint",
+    "FR_calf_joint",
+    "FL_hip_joint",
+    "FL_thigh_joint",
+    "FL_calf_joint",
+    "RR_hip_joint",
+    "RR_thigh_joint",
+    "RR_calf_joint",
+    "RL_hip_joint",
+    "RL_thigh_joint",
+    "RL_calf_joint",
+)
+
+
+def _load_init_joint_positions(init_pose_path: pathlib.Path = INIT_POSE_PATH) -> dict[str, float]:
+    """
+    从 `init_pose.npy` 加载 12 关节初始位置，并转换成 Isaac Lab 可用的关节字典。
+
+    文件要求：
+    - 支持 shape = `(12,)` 或 `(1, 12)`
+    - 数据顺序必须与 `GO2_JOINT_ORDER` 一致
+
+    返回：
+    - `dict[str, float]`
+      例如：
+      {
+        "FR_hip_joint": ...,
+        "FR_thigh_joint": ...,
+        ...
+      }
+    """
+    if not init_pose_path.exists():
+        raise FileNotFoundError(f"找不到初始姿态文件: {init_pose_path}")
+
+    init_pose = np.load(init_pose_path).astype(np.float32).reshape(-1)
+    if init_pose.shape[0] != len(GO2_JOINT_ORDER):
+        raise ValueError(
+            f"初始姿态维度不正确，期望 {len(GO2_JOINT_ORDER)} 个关节值，实际得到 {init_pose.shape[0]}"
+        )
+
+    return {joint_name: float(joint_value) for joint_name, joint_value in zip(GO2_JOINT_ORDER, init_pose)}
+
+
+GO2_INIT_JOINT_POS = _load_init_joint_positions()
+GO2_PASIST_ROBOT_CFG = ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+GO2_PASIST_ROBOT_CFG.init_state.joint_pos = GO2_INIT_JOINT_POS
+GO2_PASIST_ROBOT_CFG.init_state.joint_vel = {".*": 0.0}
 
 
 @configclass
@@ -124,7 +181,10 @@ class PasistGo2SceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    robot: ArticulationCfg = ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    # 这里显式使用本项目的 `init_pose/init_pose.npy` 作为默认关节初始位置。
+    # 又因为 `PasistEventCfg.reset_robot_joints` 使用的是 `reset_joints_by_scale`
+    # 且 position_range=(1.0, 1.0)，所以每个 episode reset 时都会回到这套关节姿态。
+    robot: ArticulationCfg = GO2_PASIST_ROBOT_CFG
 
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*",

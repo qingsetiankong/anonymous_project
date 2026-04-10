@@ -35,8 +35,8 @@ ppo:
   omega_r: 1.0 #float
 
   # PASIST / SIL 可选开关
-  enable_sil: False #bool
-  use_skill_selector: False #bool
+  enable_sil: True #bool
+  use_skill_selector: True #bool
   discriminator_config_path: "configs/training/discriminator.yaml" #str
   discriminator_batch_size: 256 #int
   discriminator_updates_per_iteration: 1 #int

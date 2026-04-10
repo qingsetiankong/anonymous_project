@@ -223,8 +223,14 @@ def main() -> None:
     )
 
     # 这些布尔开关保留为命令行覆盖项，方便快速实验。
-    parser.add_argument("--enable-sil", action="store_true", help="强制启用 SIL。")
-    parser.add_argument("--use-skill-selector", action="store_true", help="强制启用 SkillSelector。")
+    parser.add_argument("--disable-sil", dest="enable_sil", action="store_false", help="关闭 SIL。")
+    parser.add_argument(
+        "--disable-skill-selector",
+        dest="use_skill_selector",
+        action="store_false",
+        help="关闭 SkillSelector。",
+    )
+    parser.set_defaults(enable_sil=True, use_skill_selector=True)
 
     from isaaclab.app import AppLauncher
 
@@ -265,8 +271,9 @@ def main() -> None:
 
         ppotrainer_config = _load_ppo_config(ppo_config_path)
         ppotrainer_config.device = trainer_device
-        ppotrainer_config.enable_sil = bool(args.enable_sil or ppotrainer_config.enable_sil)
-        ppotrainer_config.use_skill_selector = bool(args.use_skill_selector or ppotrainer_config.use_skill_selector)
+        ppotrainer_config.discriminator_config_path = discriminator_config_path
+        ppotrainer_config.enable_sil = bool(args.enable_sil and ppotrainer_config.enable_sil)
+        ppotrainer_config.use_skill_selector = bool(args.use_skill_selector and ppotrainer_config.use_skill_selector)
 
 
         log_root = pathlib.Path(args.log_dir)
