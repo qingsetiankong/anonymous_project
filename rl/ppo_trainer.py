@@ -79,7 +79,7 @@ class PPOTrainerConfig:
     omega_r: float = 1.0
 
     # PASIST / SIL 可选开关
-    enable_sil: bool = False
+    enable_sil: bool = True
     use_skill_selector: bool = False
     discriminator_config_path: str = "configs/training/discriminator.yaml"
     discriminator_batch_size: int = 256

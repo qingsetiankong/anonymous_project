@@ -5,6 +5,7 @@ import pathlib
 
 import gymnasium as gym
 import isaaclab.sim as sim_utils
+import isaaclab.terrains as terrain_gen
 import numpy as np
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -15,10 +16,10 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from unitree_rl_lab.assets.robots.unitree import UNITREE_GO2_CFG as ROBOT_CFG
@@ -109,6 +110,50 @@ GO2_PASIST_ROBOT_CFG = ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 GO2_PASIST_ROBOT_CFG.init_state.joint_pos = GO2_INIT_JOINT_POS
 GO2_PASIST_ROBOT_CFG.init_state.joint_vel = {".*": 0.0}
 
+# PASIST 地形生成器配置。
+# 当前默认仍然只启用 flat，使训练行为继续接近平地；
+# 但结构上已经和 velocity_env_cfg.py 对齐，后续可以直接打开 rough/slope/stairs。
+PASIST_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.0, 1.0),
+    use_cache=False,
+    sub_terrains={
+        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=1.0),
+        # "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+        #     proportion=0.2,
+        #     noise_range=(0.01, 0.06),
+        #     noise_step=0.01,
+        #     border_width=0.25,
+        # ),
+        # "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+        #     proportion=0.2,
+        #     slope_range=(0.0, 0.4),
+        #     platform_width=2.0,
+        #     border_width=0.25,
+        # ),
+        # "boxes": terrain_gen.MeshRandomGridTerrainCfg(
+        #     proportion=0.2,
+        #     grid_width=0.45,
+        #     grid_height_range=(0.05, 0.2),
+        #     platform_width=2.0,
+        # ),
+        # "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
+        #     proportion=0.2,
+        #     step_height_range=(0.05, 0.23),
+        #     step_width=0.3,
+        #     platform_width=3.0,
+        #     border_width=1.0,
+        #     holes=False,
+        # ),
+    },
+)
+
 
 @configclass
 class PasistMetadataCfg:
@@ -160,18 +205,20 @@ class PasistGo2SceneCfg(InteractiveSceneCfg):
     """
     PASIST 基础场景配置。
 
-    当前仍然保持“平地 + Go2 + 接触传感器 + 天空光”的简洁结构，
-    因为你现在的首要任务是把 PASIST 算法链路先跑通，而不是先把地形复杂化。
+    当前地形实现已经升级成“generator 骨架 + flat 默认子地形”。
+    这样你既能保持当前几乎等价于平地的训练行为，又能在后续较平滑地切换到复杂地形。
 
     后面如果你要提升鲁棒性，可以优先在这里扩展：
-    - terrain: 从 plane 换成 generator
-    - 加入 height scanner
+    - 在 `PASIST_TERRAIN_CFG.sub_terrains` 中打开 rough / slope / stairs
+    - 把 `height_scanner` 观测接进 policy 或 critic
     - 加入更多传感器
     """
 
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
-        terrain_type="plane",
+        terrain_type="generator",
+        terrain_generator=PASIST_TERRAIN_CFG,
+        max_init_terrain_level=1,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -179,12 +226,29 @@ class PasistGo2SceneCfg(InteractiveSceneCfg):
             static_friction=1.0,
             dynamic_friction=1.0,
         ),
+        visual_material=sim_utils.MdlFileCfg(
+            mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+            project_uvw=True,
+            texture_scale=(0.25, 0.25),
+        ),
+        debug_vis=False,
     )
 
     # 这里显式使用本项目的 `init_pose/init_pose.npy` 作为默认关节初始位置。
     # 又因为 `PasistEventCfg.reset_robot_joints` 使用的是 `reset_joints_by_scale`
     # 且 position_range=(1.0, 1.0)，所以每个 episode reset 时都会回到这套关节姿态。
     robot: ArticulationCfg = GO2_PASIST_ROBOT_CFG
+
+    # 为未来复杂地形感知预留高度扫描传感器。
+    # 当前它还没有接进 observation，因此不会改变现有训练输入维度。
+    height_scanner = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base",
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+        debug_vis=False,
+        mesh_prim_paths=["/World/ground"],
+    )
 
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*",
@@ -468,6 +532,7 @@ class Go2PasistEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
 
         self.scene.contact_forces.update_period = self.sim.dt
+        self.scene.height_scanner.update_period = self.decimation * self.sim.dt
 
 
 @configclass

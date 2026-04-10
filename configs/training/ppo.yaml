@@ -1,6 +1,6 @@
 ppo:
   num_steps: 128 #int
-  ppo_epochs: 1000 #int
+  ppo_epochs: 4 #int
   mini_batch_size: 256 #int
   clip_epsilon: 0.2 #float
   gamma: 0.99 #float

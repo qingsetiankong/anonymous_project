@@ -7,6 +7,7 @@ import sys
 import traceback
 from datetime import datetime
 from typing import Sequence
+import numpy as np
 
 import yaml
 
@@ -59,6 +60,7 @@ def _print_run_summary(
     print(f"config_path: {config_path}")
 
 
+
 def _load_config_path(config_path: str) -> dict:
     """
     读取“配置路径索引文件”。
@@ -106,7 +108,7 @@ def _load_ppo_config(config_path: str) -> object:
     with open(config_path, "r", encoding="utf-8") as file:
         config_dict = yaml.safe_load(file) or {}
 
-    return PPOTrainerConfig(**config_dict)
+    return PPOTrainerConfig(**config_dict["ppo"])
 
 
 def _to_serializable(value):
@@ -191,6 +193,9 @@ def _build_iteration_logger(run_dir: pathlib.Path):
 
     return _log_iteration, writer
 
+def _load_keyframe_pose_bank(path) -> dict[int, np.ndarray]:
+    pose = np.load(path).astype(np.float32).reshape(-1)
+    return {0: pose}
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="运行当前项目的 PASIST PPO 训练入口。")
@@ -200,7 +205,7 @@ def main() -> None:
     parser.add_argument("--num-envs", type=int, default=1, help="并行环境数量。建议先从 1 开始。")
     parser.add_argument("--skill-names", type=str, default="walk", help="逗号分隔的 skill 名称列表。")
     parser.add_argument("--seed", type=int, default=0, help="首次 reset 使用的随机种子。")
-    parser.add_argument("--iterations", type=int, default=5, help="训练 iteration 数量。")
+    parser.add_argument("--iterations", type=int, default=100, help="训练 iteration 数量。")
     parser.add_argument(
         "--trainer-device",
         type=str,
@@ -231,6 +236,24 @@ def main() -> None:
         help="关闭 SkillSelector。",
     )
     parser.set_defaults(enable_sil=True, use_skill_selector=True)
+    parser.add_argument(
+        "--save-model-dir",
+        type=str,
+        default="checkpoints",
+        help="保存模型的目录。相对路径时会保存在本次 run_dir 下。",
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=10,
+        help="每隔多少个 iteration 保存一次模型。设为 0 表示只保存最终模型。",
+    )
+    # 单帧路径，测试用
+    parser.add_argument(
+    "--target-pose-bank",
+    type=str,
+    default="target_pose_bank/target_pose_bank.npy",
+)
 
     from isaaclab.app import AppLauncher
 
@@ -247,6 +270,7 @@ def main() -> None:
         # Isaac Sim App 启动后再导入环境与训练模块，避免初始化顺序问题。
         import envs.isaacsim_mini_envs  # noqa: F401
         import envs.pasist_env_cfg  # noqa: F401
+        import torch
         from envs.IsaacLabPasistEnv import IsaacLabPasistEnv
         from rl.ppo_trainer import PPOTrainer
         from sil.skill_selector import SkillSelector
@@ -261,6 +285,45 @@ def main() -> None:
             skill_names=skill_names,
             config_path=args.config_path,
         )
+
+        def save_model(trainer: object, save_model_dir: str, name: str):
+            """
+            保存模型到指定目录。
+
+            当前保存内容包括：
+            - policy / value 网络参数
+            - actor / critic optimizer 状态
+            - 可选的 discriminator 与其 optimizer 状态
+            - 当前 trainer 配置
+
+            注意：
+            - 这里不直接保存 `history`，因为按 iteration 中途保存时，
+              外层 `history` 还没有最终生成完。
+            """
+            save_path = pathlib.Path(save_model_dir)
+            save_path.mkdir(parents=True, exist_ok=True)
+
+            checkpoint = {
+                "policy_state_dict": trainer.policy.state_dict(),
+                # "value_state_dict": trainer.value_function.state_dict(),
+                # "actor_optimizer_state_dict": trainer.actor_optimizer.state_dict(),
+                # "critic_optimizer_state_dict": trainer.critic_optimizer.state_dict(),
+                # "config": vars(ppotrainer_config),
+            }
+
+            if getattr(trainer, "discriminator", None) is not None:
+                checkpoint["discriminator_state_dict"] = trainer.discriminator.state_dict()
+            if getattr(trainer, "discriminator_optimizer", None) is not None:
+                checkpoint["discriminator_optimizer_state_dict"] = (
+                    trainer.discriminator_optimizer.state_dict()
+                )
+
+            torch.save(
+                checkpoint,
+                save_path / f"{name}.pt",
+            )
+            print(f"[INFO] Model saved to: {save_path / f'{name}.pt'}")
+
 
         trainer_device = args.trainer_device or args.device
         # load all configs paths
@@ -288,10 +351,16 @@ def main() -> None:
         else:
             print("[WARNING] TensorBoard writer unavailable; only metrics.jsonl will be saved")
 
+        save_model_dir = pathlib.Path(args.save_model_dir)
+        if not save_model_dir.is_absolute():
+            save_model_dir = run_dir / save_model_dir
+        print(f"[INFO] Checkpoint directory: {save_model_dir}")
+
         env = IsaacLabPasistEnv(
             task_id=args.task,
             num_envs=args.num_envs,
             skill_names=skill_names,
+            target_pose_bank=_load_keyframe_pose_bank(args.target_pose_bank) if args.target_pose_bank else None,
         )
 
         skill_selector = None
@@ -308,10 +377,43 @@ def main() -> None:
             config=ppotrainer_config,
             skill_selector=skill_selector,
         )
+
+        def on_iteration_end(stats: dict[str, float]) -> None:
+            """
+            组合 iteration 日志与定期 checkpoint 保存逻辑。
+
+            调用顺序：
+            1. 先记录 metrics.jsonl / TensorBoard
+            2. 再根据 iteration 编号判断是否保存模型
+            """
+            iteration_logger(stats)
+
+            if args.save_interval <= 0:
+                return
+
+            iteration_index = int(float(stats.get("iteration", -1)))
+            if iteration_index < 0:
+                return
+
+            # iteration 从 0 开始计数，更符合用户直觉的是第 1、10、20... 轮。
+            iterations_nums = iteration_index + 1
+            if iterations_nums % args.save_interval == 0:
+                save_model(
+                    trainer=trainer,
+                    save_model_dir=str(save_model_dir),
+                    name=f"iter_{iterations_nums:06d}",
+                )
+
         history = trainer.train(
             num_iterations=args.iterations,
             seed=args.seed,
-            on_iteration_end=iteration_logger,
+            on_iteration_end=on_iteration_end,
+        )
+
+        save_model(
+            trainer=trainer,
+            save_model_dir=str(save_model_dir),
+            name="final",
         )
 
         with (run_dir / "history.json").open("w", encoding="utf-8") as file:
