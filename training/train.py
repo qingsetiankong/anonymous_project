@@ -108,7 +108,18 @@ def _load_ppo_config(config_path: str) -> object:
     with open(config_path, "r", encoding="utf-8") as file:
         config_dict = yaml.safe_load(file) or {}
 
-    return PPOTrainerConfig(**config_dict["ppo"])
+    ppo_config = dict(config_dict["ppo"])
+
+    # YAML 中的隐藏层经常写成 "(128, 128, 128)" 这种字符串。
+    # 这里统一转成 tuple[int, ...]，避免后面构建 MLP 时把字符串按字符处理。
+    ppo_config["actor_hidden_dims"] = _parse_hidden_dims_from_config(
+        ppo_config.get("actor_hidden_dims")
+    )
+    ppo_config["critic_hidden_dims"] = _parse_hidden_dims_from_config(
+        ppo_config.get("critic_hidden_dims")
+    )
+
+    return PPOTrainerConfig(**ppo_config)
 
 
 def _to_serializable(value):

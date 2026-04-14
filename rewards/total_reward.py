@@ -35,14 +35,16 @@ def compute_task_weight(task_reward: float | np.ndarray, sigma_t: float) -> floa
     """
     计算论文中的 omega_T。
 
-    当前采用一个更稳健的工程近似：
-    omega_T = exp(-max(r_T - sigma_T, 0))
+    按 PASIST 原文 Eq. (8) 实现：
 
-    直觉:
-    - 当 `task_reward <= sigma_t` 时，认为任务还没有学稳，此时 `omega_T = 1`
-    - 当 `task_reward > sigma_t` 时，`omega_T` 会随任务奖励增大而衰减
-    - 这样可以保证 `omega_T` 始终落在 `(0, 1]` 内，
-      避免出现大于 1 导致 `(1 - omega_T)` 变成负数的问题
+    omega_T = exp(-(r_T - sigma_T))
+
+    重要说明:
+    - 这里不再做之前那个“更稳健的工程裁剪近似”
+    - 因为我们这里的目标是尽量与原文一致
+    - 按这个公式，当 `task_reward < sigma_t` 时，`omega_T` 可能大于 1，
+      从而使 `(1 - omega_T)` 为负；这在工程上不一定最稳，
+      但它更接近当前论文给出的写法
 
     输入:
     - `task_reward`:
@@ -55,8 +57,7 @@ def compute_task_weight(task_reward: float | np.ndarray, sigma_t: float) -> floa
     - batched 时返回 shape = [B] 的 `np.ndarray`
     """
     task_reward_array = _as_float_array(task_reward)
-    clipped_gap = np.maximum(task_reward_array - float(sigma_t), 0.0)
-    omega_t = np.exp(-clipped_gap, dtype=np.float32)
+    omega_t = np.exp(-(task_reward_array - float(sigma_t)), dtype=np.float32)
     return _maybe_scalar(omega_t)
 
 
@@ -71,7 +72,7 @@ def compute_total_reward(
     """
     计算论文中的总奖励 r。
 
-    对应 Eq. (6):
+    对应 PASIST Eq. (6):
     r = omega_SIL * omega_T * r_SIL + (1 - omega_T) * r_T + omega_R * r_R
 
     参数:

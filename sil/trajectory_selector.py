@@ -77,9 +77,34 @@ class TrajectorySelector:
     避免某个高回报 skill 把其他 skill 完全压制掉。
     """
 
-    def __init__(self, dtw_weight: float = 0.1, default_threshold: float = -np.inf) -> None:
+    def __init__(
+        self,
+        dtw_weight: float = 0.1,
+        default_threshold: float = -np.inf,
+        reference_length_ratio: float = 0.5,
+        normalize_dtw: bool = True,
+        dtw_feature_slices: list[tuple[int, int]] | None = None,
+    ) -> None:
+        """
+        参数:
+        - `dtw_weight`:
+          DTW 在 assessment score 中的惩罚权重
+        - `default_threshold`:
+          各 skill 初始接纳阈值
+        - `reference_length_ratio`:
+          参考序列长度相对采样轨迹长度的比例
+          PASIST 原文里 target pose 会扩展到 “half length”，因此默认设为 `0.5`
+        - `normalize_dtw`:
+          是否把 DTW 从累计代价转换为平均代价
+        - `dtw_feature_slices`:
+          可选；若提供，则 DTW 只使用这些切片对应的特征
+          当前默认 `None`，表示直接使用完整 imitation observation
+        """
         self.dtw_weight = float(dtw_weight)
         self.default_threshold = float(default_threshold)
+        self.reference_length_ratio = float(max(reference_length_ratio, 1e-6))
+        self.normalize_dtw = bool(normalize_dtw)
+        self.dtw_feature_slices = list(dtw_feature_slices) if dtw_feature_slices is not None else None
         self._best_scores: dict[int, float] = {}
 
     def best_score(self, skill_id: int) -> float:
@@ -97,16 +122,39 @@ class TrajectorySelector:
             raise ValueError("轨迹序列必须能转换成二维数组 [T, D]")
         return array
 
+    def _select_dtw_features(self, sequence_array: np.ndarray) -> np.ndarray:
+        """
+        从轨迹特征中提取参与 DTW 的子空间。
+
+        默认行为:
+        - 如果 `dtw_feature_slices is None`，直接使用完整特征
+        - 如果提供了切片列表，就按这些切片拼接成新的 DTW 特征
+
+        这样后面如果你想把 DTW 限定到 joint position，
+        只需要在构造时传相应切片，而不用重写核心逻辑。
+        """
+        if self.dtw_feature_slices is None:
+            return sequence_array
+
+        features = [sequence_array[..., start:end] for start, end in self.dtw_feature_slices]
+        if not features:
+            raise ValueError("dtw_feature_slices 为空，无法构造 DTW 特征")
+        return np.concatenate(features, axis=-1).astype(np.float32, copy=False)
+
     def replicate_target_pose(self, target_pose, trajectory_length: int) -> np.ndarray:
         """
         将单帧 target pose 复制成一段参考序列。
 
-        按论文描述，目标姿态会沿时间轴重复，
-        用于和采样轨迹做 DTW 匹配。
+        按 PASIST 原文描述：
+        - target pose 会沿时间轴重复
+        - 参考序列长度取采样轨迹的 half length
+
+        这里通过 `reference_length_ratio` 参数实现，
+        默认值为 `0.5`。
         """
-        trajectory_length = max(int(trajectory_length), 1)
+        reference_length = max(int(np.ceil(int(trajectory_length) * self.reference_length_ratio)), 1)
         target_pose = _to_numpy(target_pose, dtype=np.float32).reshape(1, -1)
-        return np.repeat(target_pose, trajectory_length, axis=0)
+        return np.repeat(target_pose, reference_length, axis=0)
 
     def dtw_distance(self, sequence_a, sequence_b) -> float:
         """
@@ -114,24 +162,37 @@ class TrajectorySelector:
 
         距离定义:
         - 每个时间点之间的局部距离使用 L2 norm
-        - 最终返回动态规划得到的最小累计匹配代价
+        - 默认返回“平均对齐代价”，而不是原始累计代价
+          这样可以减少轨迹长度变化带来的数值偏置
         """
-        seq_a = self._to_sequence_array(sequence_a)
-        seq_b = self._to_sequence_array(sequence_b)
+        seq_a = self._select_dtw_features(self._to_sequence_array(sequence_a))
+        seq_b = self._select_dtw_features(self._to_sequence_array(sequence_b))
 
         cost = np.full((len(seq_a) + 1, len(seq_b) + 1), np.inf, dtype=np.float32)
+        path_length = np.full((len(seq_a) + 1, len(seq_b) + 1), np.inf, dtype=np.float32)
         cost[0, 0] = 0.0
+        path_length[0, 0] = 0.0
 
         for index_a in range(1, len(seq_a) + 1):
             for index_b in range(1, len(seq_b) + 1):
                 local_cost = np.linalg.norm(seq_a[index_a - 1] - seq_b[index_b - 1])
-                cost[index_a, index_b] = local_cost + min(
-                    cost[index_a - 1, index_b],
-                    cost[index_a, index_b - 1],
-                    cost[index_a - 1, index_b - 1],
+                predecessor_candidates = (
+                    (cost[index_a - 1, index_b], path_length[index_a - 1, index_b]),
+                    (cost[index_a, index_b - 1], path_length[index_a, index_b - 1]),
+                    (cost[index_a - 1, index_b - 1], path_length[index_a - 1, index_b - 1]),
                 )
+                best_cost, best_steps = min(predecessor_candidates, key=lambda item: item[0])
+                cost[index_a, index_b] = local_cost + best_cost
+                path_length[index_a, index_b] = best_steps + 1.0
 
-        return float(cost[len(seq_a), len(seq_b)])
+        total_cost = float(cost[len(seq_a), len(seq_b)])
+        if not self.normalize_dtw:
+            return total_cost
+
+        total_steps = float(path_length[len(seq_a), len(seq_b)])
+        if total_steps <= 0.0:
+            return total_cost
+        return total_cost / total_steps
 
     def task_return(self, trajectory: EpisodeTrajectory) -> float:
         """
@@ -150,7 +211,7 @@ class TrajectorySelector:
         - task_return
         - dtw_distance
 
-        这里采用一个实用、容易调试的实现：
+        这里采用一个实用、容易调试且更贴近 PASIST 的实现：
         assessment_score = task_return - dtw_weight * dtw_distance
 
         直觉:

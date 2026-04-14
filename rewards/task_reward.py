@@ -59,6 +59,18 @@ def _maybe_scalar(value: np.ndarray | np.generic | float) -> float | np.ndarray:
     return array.astype(np.float32, copy=False)
 
 
+def _all_skill_ids_equal(skill_id: int | np.ndarray | None, expected_skill_id: int) -> bool:
+    """
+    判断当前 batch 是否全部属于同一个 skill。
+
+    这有助于在单技能阶段走更清晰的 reward 分支。
+    """
+    if skill_id is None:
+        return True
+    skill_array = np.asarray(skill_id)
+    return bool(np.all(skill_array == int(expected_skill_id)))
+
+
 def pose_tracking_reward(
     imitation_observation: Any,
     target_pose: Any,
@@ -106,6 +118,48 @@ def pose_tracking_reward(
     return _maybe_scalar(reward)
 
 
+def upright_posture_reward(
+    imitation_observation: Any,
+    sigma: float = 0.25,
+    projected_gravity_slice: tuple[int, int] = (3, 6),
+    upright_reference: tuple[float, float, float] = (0.0, 0.0, -1.0),
+) -> float | np.ndarray:
+    """
+    计算机身直立奖励。
+
+    这是当前 `walk` 技能里更贴近 PASIST 风格的 task reward 子项：
+    - 它不直接让 `r_T` 去拟合整帧 target pose
+    - 而是鼓励机器人保持稳定、自然的直立姿态
+
+    参数:
+    - `imitation_observation`:
+      当前 imitation 特征，默认假设其中 `[3:6]` 是 projected_gravity
+    - `sigma`:
+      奖励缩放系数
+    - `projected_gravity_slice`:
+      projected_gravity 在 imitation 向量中的切片
+    - `upright_reference`:
+      理想直立时的 projected_gravity，当前假设为 `(0, 0, -1)`
+
+    返回:
+    - 单样本时为 `float`
+    - batched 时为 shape = [B] 的 `np.ndarray`
+    """
+    observation = _as_float_vector_or_batch(imitation_observation)
+    start, end = projected_gravity_slice
+    if observation.shape[-1] < end:
+        raise ValueError(
+            "imitation_observation 维度不足，无法提取 projected_gravity；"
+            f"需要至少到索引 {end}，实际为 {observation.shape[-1]}"
+        )
+
+    projected_gravity = observation[..., start:end]
+    reference = np.asarray(upright_reference, dtype=np.float32)
+    error = np.linalg.norm(projected_gravity - reference, axis=-1 if projected_gravity.ndim >= 2 else 0)
+    reward = np.exp(-error / max(float(sigma), 1e-6)).astype(np.float32, copy=False)
+    return _maybe_scalar(reward)
+
+
 def velocity_tracking_reward(
     commanded_velocity: float | np.ndarray,
     measured_velocity: float | np.ndarray,
@@ -132,6 +186,42 @@ def velocity_tracking_reward(
     commanded = _as_float_array(commanded_velocity)
     measured = _as_float_array(measured_velocity)
     error = np.abs(commanded - measured)
+    reward = np.exp(-error / max(float(sigma), 1e-6)).astype(np.float32, copy=False)
+    return _maybe_scalar(reward)
+
+
+def yaw_tracking_reward(
+    commanded_yaw_rate: float | np.ndarray,
+    measured_yaw_rate: float | np.ndarray,
+    sigma: float = 0.25,
+) -> float | np.ndarray:
+    """
+    计算 yaw 角速度跟踪奖励。
+
+    当前训练入口还没有真正传入 yaw command，
+    但这里先把接口留好，后续只要 trainer / env 提供对应量即可启用。
+    """
+    commanded = _as_float_array(commanded_yaw_rate)
+    measured = _as_float_array(measured_yaw_rate)
+    error = np.abs(commanded - measured)
+    reward = np.exp(-error / max(float(sigma), 1e-6)).astype(np.float32, copy=False)
+    return _maybe_scalar(reward)
+
+
+def base_height_reward(
+    base_height: float | np.ndarray,
+    target_base_height: float | np.ndarray,
+    sigma: float = 0.05,
+) -> float | np.ndarray:
+    """
+    计算 base height 跟踪奖励。
+
+    PASIST 原文里 `walk / crawl / stilt` 的一个关键区分因素就是 base height。
+    当前最小环境还没有稳定把 base height 传进 trainer，因此这里只预留接口。
+    """
+    height = _as_float_array(base_height)
+    target = _as_float_array(target_base_height)
+    error = np.abs(height - target)
     reward = np.exp(-error / max(float(sigma), 1e-6)).astype(np.float32, copy=False)
     return _maybe_scalar(reward)
 
@@ -163,6 +253,94 @@ def command_consistency_reward(
     return _maybe_scalar(reward)
 
 
+def compute_walk_task_reward(
+    imitation_observation: Any,
+    commanded_velocity: float | np.ndarray,
+    measured_velocity: float | np.ndarray,
+    posture_weight: float = 0.5,
+    velocity_weight: float = 1.0,
+    posture_sigma: float = 0.25,
+    velocity_sigma: float = 0.25,
+    commanded_yaw_rate: float | np.ndarray | None = None,
+    measured_yaw_rate: float | np.ndarray | None = None,
+    yaw_weight: float = 0.0,
+    yaw_sigma: float = 0.25,
+    base_height: float | np.ndarray | None = None,
+    target_base_height: float | np.ndarray | None = None,
+    height_weight: float = 0.0,
+    height_sigma: float = 0.05,
+) -> float | np.ndarray:
+    """
+    计算当前单技能 `walk` 的 task reward。
+
+    设计原则:
+    - 更贴近 PASIST 论文里“按 skill 手工设计 r_T”的思路
+    - `walk` 的 `r_T` 主要关注任务本身：
+      - 跟随速度命令前进
+      - 保持直立、稳定
+    - 不把整帧 target pose 匹配塞进 `r_T`
+      - target pose / DTW 的作用主要留给轨迹筛选与 SIL
+
+    当前默认启用的两项:
+    - `velocity_tracking_reward`
+    - `upright_posture_reward`
+
+    预留但默认关闭的两项:
+    - `yaw_tracking_reward`
+    - `base_height_reward`
+    """
+    reward = np.asarray(
+        float(velocity_weight)
+        * velocity_tracking_reward(
+            commanded_velocity=commanded_velocity,
+            measured_velocity=measured_velocity,
+            sigma=velocity_sigma,
+        ),
+        dtype=np.float32,
+    )
+
+    reward = reward + np.asarray(
+        float(posture_weight)
+        * upright_posture_reward(
+            imitation_observation=imitation_observation,
+            sigma=posture_sigma,
+        ),
+        dtype=np.float32,
+    )
+
+    if (
+        yaw_weight != 0.0
+        and commanded_yaw_rate is not None
+        and measured_yaw_rate is not None
+    ):
+        reward = reward + np.asarray(
+            float(yaw_weight)
+            * yaw_tracking_reward(
+                commanded_yaw_rate=commanded_yaw_rate,
+                measured_yaw_rate=measured_yaw_rate,
+                sigma=yaw_sigma,
+            ),
+            dtype=np.float32,
+        )
+
+    if (
+        height_weight != 0.0
+        and base_height is not None
+        and target_base_height is not None
+    ):
+        reward = reward + np.asarray(
+            float(height_weight)
+            * base_height_reward(
+                base_height=base_height,
+                target_base_height=target_base_height,
+                sigma=height_sigma,
+            ),
+            dtype=np.float32,
+        )
+
+    return _maybe_scalar(reward)
+
+
 def compute_task_reward(
     imitation_observation: Any,
     target_pose: Any,
@@ -175,21 +353,32 @@ def compute_task_reward(
     command_weight: float = 0.0,
     pose_sigma: float = 1.0,
     velocity_sigma: float = 0.25,
+    commanded_yaw_rate: float | np.ndarray | None = None,
+    measured_yaw_rate: float | np.ndarray | None = None,
+    yaw_weight: float = 0.0,
+    yaw_sigma: float = 0.25,
+    base_height: float | np.ndarray | None = None,
+    target_base_height: float | np.ndarray | None = None,
+    height_weight: float = 0.0,
+    height_sigma: float = 0.05,
 ) -> float | np.ndarray:
     """
     计算论文中的 task reward r_T。
 
-    这不是论文里唯一可能的 reward 形式，而是一套和你当前代码结构兼容、
-    适合逐步复现的组合版本：
-    - 核心项: 姿态跟踪奖励
-    - 可选项: 速度跟踪奖励
-    - 可选项: command 一致性奖励
+    当前实现采用“按 skill 分派”的方式：
+    - `walk` 技能：
+      使用更贴近 PASIST 风格的手工任务奖励，
+      主要由速度跟踪和直立姿态组成
+    - 其它技能：
+      暂时回退到通用的姿态匹配近似版本，避免在多技能尚未实现前直接失效
 
     参数:
-    - imitation_observation / target_pose: 姿态匹配主信号
-    - commanded_velocity / measured_velocity: 可选的速度命令跟踪信号
-    - skill_id / command_skill_id: 可选的技能一致性信号
-    - *_weight: 各个子奖励项的权重
+    重要说明:
+    - 对 `walk` 而言，`target_pose` 当前不再直接参与 `r_T` 主体计算，
+      它主要用于：
+      - trajectory selector 中的 DTW
+      - SIL / keyframe 约束
+    - 这更接近 PASIST 中“task reward 手工设计、pose 相似性用于轨迹筛选”的分工
 
     输入形状:
     - 单样本模式：
@@ -209,6 +398,27 @@ def compute_task_reward(
     - 这版实现已经兼容 Isaac Lab 并行环境常见的 batched 输入
     - 如果上游只处理单环境，你仍然会得到熟悉的标量输出
     """
+    if _all_skill_ids_equal(skill_id, expected_skill_id=0):
+        return compute_walk_task_reward(
+            imitation_observation=imitation_observation,
+            commanded_velocity=0.0 if commanded_velocity is None else commanded_velocity,
+            measured_velocity=0.0 if measured_velocity is None else measured_velocity,
+            posture_weight=pose_weight,
+            velocity_weight=velocity_weight,
+            posture_sigma=pose_sigma,
+            velocity_sigma=velocity_sigma,
+            commanded_yaw_rate=commanded_yaw_rate,
+            measured_yaw_rate=measured_yaw_rate,
+            yaw_weight=yaw_weight,
+            yaw_sigma=yaw_sigma,
+            base_height=base_height,
+            target_base_height=target_base_height,
+            height_weight=height_weight,
+            height_sigma=height_sigma,
+        )
+
+    # 对于尚未专门定义 task reward 的技能，先回退到旧的通用近似版本，
+    # 这样后续扩 crawl / stilt / bipedalize 时不会立刻把整个训练链打断。
     reward = np.asarray(
         float(pose_weight)
         * pose_tracking_reward(

@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-import actor_critic as ac
 from torch.distributions import Normal
 
 from envs.BasePasistEnv import BasePasistEnv, PasistCommand
@@ -86,6 +85,9 @@ class PPOTrainerConfig:
     discriminator_updates_per_iteration: int = 1
     sil_buffer_capacity_per_skill: int = 8
     trajectory_dtw_weight: float = 0.1
+    trajectory_reference_length_ratio: float = 0.5
+    trajectory_normalize_dtw: bool = True
+    trajectory_dtw_feature_slices: list[tuple[int, int]] | None = None
 
 
 class GaussianPolicy(nn.Module):
@@ -235,6 +237,9 @@ class PPOTrainer:
         )
         self.trajectory_selector = trajectory_selector or TrajectorySelector(
             dtw_weight=self.config.trajectory_dtw_weight,
+            reference_length_ratio=self.config.trajectory_reference_length_ratio,
+            normalize_dtw=self.config.trajectory_normalize_dtw,
+            dtw_feature_slices=self._normalize_feature_slices(self.config.trajectory_dtw_feature_slices),
         )
 
         self.discriminator = discriminator
@@ -323,6 +328,8 @@ class PPOTrainer:
         reward_task_sum = 0.0
         reward_reg_sum = 0.0
         reward_sil_sum = 0.0
+        omega_t_sum = 0.0
+        omega_sil_sum = 0.0
         done_count = 0.0
 
         for _ in range(self.config.num_steps):
@@ -394,6 +401,8 @@ class PPOTrainer:
             reward_task_sum += float(np.asarray(reward_terms["task_reward"]).mean())
             reward_reg_sum += float(np.asarray(reward_terms["regularization_reward"]).mean())
             reward_sil_sum += float(np.asarray(reward_terms["sil_reward"]).mean())
+            omega_t_sum += float(np.asarray(reward_terms["omega_t"]).mean())
+            omega_sil_sum += float(np.asarray(reward_terms["omega_sil"]).mean())
             done_count += float(done_array.sum())
 
             self._current_obs = next_obs_batch
@@ -417,6 +426,8 @@ class PPOTrainer:
             "rollout_reward_task_mean": reward_task_sum / max(self.config.num_steps, 1),
             "rollout_reward_reg_mean": reward_reg_sum / max(self.config.num_steps, 1),
             "rollout_reward_sil_mean": reward_sil_sum / max(self.config.num_steps, 1),
+            "rollout_omega_t_mean": omega_t_sum / max(self.config.num_steps, 1),
+            "rollout_omega_sil_mean": omega_sil_sum / max(self.config.num_steps, 1),
             "rollout_done_count": done_count,
         }
 
@@ -719,6 +730,34 @@ class PPOTrainer:
         if str(device_name).startswith("cuda") and torch.cuda.is_available():
             return torch.device(device_name)
         return torch.device("cpu")
+
+    def _normalize_feature_slices(
+        self,
+        feature_slices: list[tuple[int, int]] | list[list[int]] | tuple[tuple[int, int], ...] | None,
+    ) -> list[tuple[int, int]] | None:
+        """
+        统一整理 DTW 特征切片配置。
+
+        兼容来自 YAML 的常见写法：
+        - `null`
+        - `[[6, 18]]`
+        - `[(6, 18)]`
+
+        默认返回 `None`，表示保持当前 DTW 使用完整 imitation 特征的行为，
+        从而不影响现有功能。
+        """
+        if feature_slices is None:
+            return None
+
+        normalized: list[tuple[int, int]] = []
+        for item in feature_slices:
+            if len(item) != 2:
+                raise ValueError(
+                    "trajectory_dtw_feature_slices 中的每个切片都必须有两个元素，例如 [6, 18]"
+                )
+            start, end = int(item[0]), int(item[1])
+            normalized.append((start, end))
+        return normalized
 
     def _ensure_batch_observation(self, observation: Any) -> np.ndarray:
         """

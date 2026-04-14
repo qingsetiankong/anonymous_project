@@ -6,10 +6,10 @@ ppo:
   gamma: 0.99 #float
   gae_lambda: 0.95 #float
   actor_lr: 3.0e-4 #float
-  critic_lr: 1.0e-3 #float
+  critic_lr: 5e-3 #float
   max_grad_norm: 1.0 #float
   value_loss_coef: 0.5 #float
-  entropy_coef: 0.0 #float
+  entropy_coef: 0.002 #float
   device: "cpu" #str
 
   # policy / value 网络结构
@@ -18,10 +18,13 @@ ppo:
   init_log_std: -0.5 #float
 
   # task reward 相关超参数
-  pose_weight: 1.0 #float
-  velocity_weight: 0.0 #float
+  # 当前 walk 版本里：
+  # - pose_weight 主要作为直立姿态奖励的权重
+  # - velocity_weight 主要作为速度跟踪奖励的权重
+  pose_weight: 0.5 #float
+  velocity_weight: 1.0 #float
   command_weight: 0.0 #float
-  pose_sigma: 1.0 #float
+  pose_sigma: 0.25 #float
   velocity_sigma: 0.25 #float
 
   # regularization reward 相关超参数
@@ -30,8 +33,8 @@ ppo:
   stability_weight: 0.0 #float
 
   # total reward 动态权重相关超参数
-  sigma_t: 0.5 #float
-  sigma_sil: 0.5 #float
+  sigma_t: 0.15 #float
+  sigma_sil: 1.2 #float
   omega_r: 1.0 #float
 
   # PASIST / SIL 可选开关
@@ -42,6 +45,11 @@ ppo:
   discriminator_updates_per_iteration: 1 #int
   sil_buffer_capacity_per_skill: 8 #int
   trajectory_dtw_weight: 0.1 #float
+  # 下面三项默认值与当前代码行为保持一致，仅用于后续调参时开放配置接口。
+  trajectory_reference_length_ratio: 0.5 #float
+  trajectory_normalize_dtw: true #bool
+  trajectory_dtw_feature_slices:
+    - [6, 18] # 当前只让 DTW 比较 joint_pos_rel
 
 seed:
   seed: 0 #int

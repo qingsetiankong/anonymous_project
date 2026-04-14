@@ -34,9 +34,16 @@ def compute_sil_weight(mean_dtw_distance: float, sigma_sil: float, num_skills: i
     """
     根据 DTW 统计值计算 SIL 奖励权重 omega_SIL。
 
-    该实现是对论文 Eq. (7) 的一个工程化近似：
-    - mean_dtw_distance 越小，说明 SIL buffer 中的高质量轨迹越接近目标姿态
-    - 此时我们更愿意相信自模仿信号，因此 omega_SIL 会更大
+    按 PASIST 原文 Eq. (7) 的含义实现：
+
+    omega_SIL = exp(-(mean_dtw_distance - sigma_sil))
+
+    这里的 `mean_dtw_distance` 约定为：
+    - 已经对所有 skill 做过平均的全局 DTW 统计
+    - 也就是等价于论文中的 `(1 / N_m) * sum_p E[dDTW(...)]`
+
+    因此，虽然函数签名中仍然保留 `num_skills` 参数以兼容现有调用链，
+    但当前实现不会再次除以 `num_skills`，避免重复平均。
 
     参数:
     - `mean_dtw_distance`:
@@ -44,11 +51,11 @@ def compute_sil_weight(mean_dtw_distance: float, sigma_sil: float, num_skills: i
     - `sigma_sil`:
       控制缩放的超参数
     - `num_skills`:
-      技能数，用于做简单归一化，避免技能数变多时权重失控
+      为兼容旧接口而保留；当前公式实现中不再直接使用
 
     返回:
     - `float`
-      即 `omega_SIL`，范围在 `[0, 1]`
+      即 `omega_SIL`
 
     额外约定:
     - 如果 `mean_dtw_distance` 不是有限数值，例如 `inf`，
@@ -57,8 +64,8 @@ def compute_sil_weight(mean_dtw_distance: float, sigma_sil: float, num_skills: i
     """
     if not np.isfinite(float(mean_dtw_distance)):
         return 0.0
-    normalized = max(float(mean_dtw_distance) - float(sigma_sil), 0.0) / max(int(num_skills), 1)
-    return float(np.exp(-normalized))
+    del num_skills
+    return float(np.exp(-(float(mean_dtw_distance) - float(sigma_sil))))
 
 
 def compute_mean_sil_dtw(summary_by_skill: dict[int, dict[str, float]]) -> float:
