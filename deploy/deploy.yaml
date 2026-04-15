@@ -1,0 +1,79 @@
+joint_ids_map: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
+pose_reference_order: sdk
+step_dt: 0.02
+stiffness: [25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0]
+damping: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+#default_joint_pos: [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]
+default_joint_pos: [-0.03584312,  0.6307912,  -1.4495131,   0.04133042,  0.7432153,  -1.2860187,
+  -0.04333423,  0.9148848,  -1.4448581,   0.06747473, 0.8515197,  -1.5170943 ]
+#target_joint_rel: [0.08341989,  0.14708692, 0.372761,   -0.11697252, -0.19862634,  0.22973073,
+ # 0.09144446, -0.25341803,  0.06689692, -0.09542388,  0.08184278,  0.3204137]
+target_joint_pos: [0.04757677,  0.77787812, -1.0767521,  -0.0756421,   0.54458896, -1.05628797,
+  0.04811023,  0.66146677, -1.37796118, -0.02794915,  0.93336248, -1.1966806 ]
+sim_debug:
+  zero_gravity_during_follow: false
+  lock_base_during_follow: true
+  reset_base_height_offset: 0
+controller:
+  mode: onnx_policy # interpolation 通信检查模式,仅插值 ; onnx_policy 推理模式
+  onnx_model_path: ../result/policy.onnx
+  onnx_input_name: observations
+  onnx_output_name: actions
+commands:
+  base_velocity:
+    ranges:
+      lin_vel_x: [1.0, 1.0]
+      lin_vel_y: [0, 0]
+      ang_vel_z: [0, 0]
+      heading: null
+actions:
+  JointPositionAction:
+    clip:
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    - [-100.0, 100.0]
+    joint_names: [.*]
+    scale: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
+    #offset: [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]
+    offset: [-0.03584312,  0.6307912,  -1.4495131,   0.04133042,  0.7432153,  -1.2860187, -0.04333423,  0.9148848,  -1.4448581,   0.06747473, 0.8515197,  -1.5170943 ]
+    joint_ids: null
+observations:
+  base_ang_vel:
+    params: {}
+    clip: [-100, 100]
+    scale: [0.2, 0.2, 0.2]
+    history_length: 1
+  projected_gravity:
+    params: {}
+    clip: [-100, 100]
+    scale: [1.0, 1.0, 1.0]
+    history_length: 1
+  velocity_commands:
+    params: {command_name: base_velocity}
+    clip: [-100, 100]
+    scale: [1.0, 1.0, 1.0]
+    history_length: 1
+  joint_pos_rel:
+    params: {}
+    clip: [-100, 100]
+    scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    history_length: 1
+  joint_vel_rel:
+    params: {}
+    clip: [-100, 100]
+    scale: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+    history_length: 1
+  last_action:
+    params: {}
+    clip: [-100, 100]
+    scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    history_length: 1
