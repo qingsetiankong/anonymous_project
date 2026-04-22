@@ -84,6 +84,8 @@ class TrajectorySelector:
         reference_length_ratio: float = 0.5,
         normalize_dtw: bool = True,
         dtw_feature_slices: list[tuple[int, int]] | None = None,
+        min_task_return: float = -np.inf,
+        max_dtw_distance: float = np.inf,
     ) -> None:
         """
         参数:
@@ -99,12 +101,20 @@ class TrajectorySelector:
         - `dtw_feature_slices`:
           可选；若提供，则 DTW 只使用这些切片对应的特征
           当前默认 `None`，表示直接使用完整 imitation observation
+        - `min_task_return`:
+          轨迹进入 SIL buffer 前必须达到的最低累计 task reward。
+          用于挡住训练初期明显不合格的轨迹。
+        - `max_dtw_distance`:
+          轨迹进入 SIL buffer 前允许的最大 DTW 距离。
+          用于挡住和目标 keyframe 风格差异过大的轨迹。
         """
         self.dtw_weight = float(dtw_weight)
         self.default_threshold = float(default_threshold)
         self.reference_length_ratio = float(max(reference_length_ratio, 1e-6))
         self.normalize_dtw = bool(normalize_dtw)
         self.dtw_feature_slices = list(dtw_feature_slices) if dtw_feature_slices is not None else None
+        self.min_task_return = float(min_task_return)
+        self.max_dtw_distance = float(max_dtw_distance)
         self._best_scores: dict[int, float] = {}
 
     def best_score(self, skill_id: int) -> float:
@@ -234,7 +244,11 @@ class TrajectorySelector:
         """
         score, total_task_reward, dtw = self.assessment_score(trajectory=trajectory, target_pose=target_pose)
         skill_id = int(trajectory.skill_id)
-        accepted = score > self.best_score(skill_id)
+        passed_quality_gate = (
+            total_task_reward >= self.min_task_return
+            and dtw <= self.max_dtw_distance
+        )
+        accepted = passed_quality_gate and (score > self.best_score(skill_id))
         if accepted:
             self._best_scores[skill_id] = score
 

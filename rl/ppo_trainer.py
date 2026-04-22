@@ -23,7 +23,7 @@ from rewards import (
 )
 from rl.actor_critic_new import MLP
 from rl.rollout_buffer import RolloutBuffer
-from sil.discriminator import SILDiscriminator
+from sil.discriminator import SILDiscriminator, load_discriminator_config
 from sil.sil_buffer import SILBuffer
 from sil.skill_selector import SkillSelector
 from sil.trajectory_selector import TrajectorySelector
@@ -257,6 +257,15 @@ class PPOTrainer:
                 velocity_range=env.velocity_range,
             )
 
+        discriminator_config: dict[str, Any] = {}
+        discriminator_config_path = Path(self.config.discriminator_config_path)
+        if discriminator_config_path.exists():
+            discriminator_config = load_discriminator_config(discriminator_config_path)
+
+        trajectory_selector_cfg = discriminator_config.get("trajectory_selector", {})
+        if not isinstance(trajectory_selector_cfg, dict):
+            trajectory_selector_cfg = {}
+
         self.sil_buffer = sil_buffer or SILBuffer(
             capacity_per_skill=self.config.sil_buffer_capacity_per_skill,
         )
@@ -265,18 +274,19 @@ class PPOTrainer:
             reference_length_ratio=self.config.trajectory_reference_length_ratio,
             normalize_dtw=self.config.trajectory_normalize_dtw,
             dtw_feature_slices=self._normalize_feature_slices(self.config.trajectory_dtw_feature_slices),
+            min_task_return=float(trajectory_selector_cfg.get("min_task_return", -np.inf)),
+            max_dtw_distance=float(trajectory_selector_cfg.get("max_dtw_distance", np.inf)),
         )
 
         self.discriminator = discriminator
         self.discriminator_optimizer = discriminator_optimizer
         if self.config.enable_sil and self.discriminator is None:
-            config_path = Path(self.config.discriminator_config_path)
-            if config_path.exists():
+            if discriminator_config_path.exists():
                 self.discriminator = SILDiscriminator.from_yaml(
                     input_dim=self._infer_discriminator_input_dim(),
-                    config_path=config_path,
+                    config_path=discriminator_config_path,
                 ).to(self.device)
-                self.discriminator_optimizer = self.discriminator.build_optimizer(config_path=config_path)
+                self.discriminator_optimizer = self.discriminator.build_optimizer(config_path=discriminator_config_path)
 
         # 判别器只看 joint_pos_rel，因此这里给它单独做一个固定尺度归一化。
         # 选 0.25 rad 的原因是与关节位置动作项的 scale 保持一致，
