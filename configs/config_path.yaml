@@ -1,6 +1,11 @@
 ppo_config_path:
   PPOTrainer_config_path: configs/training/ppo.yaml
 
+reward_weight_config_path:
+  RewardWeight_config_path: configs/rewards/weight.yaml
+
+skill_one_hot_config_path:
+  SkillOneHot_config_path: configs/skills/skill_one_hot.yaml
 
 discriminator_config_path:
   Discriminator_config_path: configs/training/discriminator.yaml

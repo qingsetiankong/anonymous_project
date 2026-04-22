@@ -15,27 +15,11 @@ ppo:
   # policy / value 网络结构
   actor_hidden_dims: (128, 128, 128) #tuple[int, ...]
   critic_hidden_dims: (128, 128, 128) #tuple[int, ...]
+  actor_activation: "elu" #str
+  critic_activation: "elu" #str
   init_log_std: -0.5 #float
 
-  # task reward 相关超参数
-  # 当前 walk 版本里：
-  # - pose_weight 主要作为直立姿态奖励的权重
-  # - velocity_weight 主要作为速度跟踪奖励的权重
-  pose_weight: 0.5 #float
-  velocity_weight: 1.0 #float
-  command_weight: 0.0 #float
-  pose_sigma: 0.25 #float
-  velocity_sigma: 0.25 #float
-
-  # regularization reward 相关超参数
-  action_weight: 1.0e-3 #float
-  smoothness_weight: 1.0e-3 #float
-  stability_weight: 0.0 #float
-
-  # total reward 动态权重相关超参数
-  sigma_t: 0.15 #float
-  sigma_sil: 1.2 #float
-  omega_r: 1.0 #float
+  # reward 相关超参数统一放到 `configs/rewards/weight.yaml`
 
   # PASIST / SIL 可选开关
   enable_sil: True #bool
@@ -49,7 +33,7 @@ ppo:
   trajectory_reference_length_ratio: 0.5 #float
   trajectory_normalize_dtw: true #bool
   trajectory_dtw_feature_slices:
-    - [6, 18] # 当前只让 DTW 比较 joint_pos_rel
+    - [0, 13] # 只比较前 13 维：base_height + joint_pos_rel
 
 seed:
   seed: 0 #int

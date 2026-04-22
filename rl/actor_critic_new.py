@@ -1,15 +1,80 @@
-import yaml
-import gymnasium as gym 
+import os
+
+import gymnasium as gym
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import os
+import yaml
+
 from rl import rl_utils
 
+
+def resolve_activation(activation_name: str | None):
+    """
+    将字符串形式的激活函数名称解析为可调用对象。
+
+    支持的名称:
+    - `relu`
+    - `elu`
+    - `tanh`
+    - `leaky_relu`
+    - `gelu`
+    - `silu` / `swish`
+    - `identity` / `none`
+    """
+    if activation_name is None:
+        return lambda x: x
+
+    normalized = str(activation_name).strip().lower()
+    mapping = {
+        "relu": F.relu,
+        "elu": F.elu,
+        "tanh": torch.tanh,
+        "leaky_relu": F.leaky_relu,
+        "gelu": F.gelu,
+        "silu": F.silu,
+        "swish": F.silu,
+        "identity": lambda x: x,
+        "none": lambda x: x,
+    }
+    if normalized not in mapping:
+        supported = ", ".join(sorted(mapping))
+        raise ValueError(f"不支持的激活函数: {activation_name!r}。支持: {supported}")
+    return mapping[normalized]
+
+
+def build_activation_module(activation_name: str | None) -> nn.Module:
+    """
+    将激活函数名称解析为 `nn.Module`，便于网络结构打印成 `Sequential(...)`。
+    """
+    normalized = "identity" if activation_name is None else str(activation_name).strip().lower()
+    mapping = {
+        "relu": nn.ReLU,
+        "elu": nn.ELU,
+        "tanh": nn.Tanh,
+        "leaky_relu": nn.LeakyReLU,
+        "gelu": nn.GELU,
+        "silu": nn.SiLU,
+        "swish": nn.SiLU,
+        "identity": nn.Identity,
+        "none": nn.Identity,
+    }
+    if normalized not in mapping:
+        supported = ", ".join(sorted(mapping))
+        raise ValueError(f"不支持的激活函数: {activation_name!r}。支持: {supported}")
+    return mapping[normalized]()
+
 class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dims, output_dim, output_activation=None):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dims,
+        output_dim,
+        output_activation=None,
+        hidden_activation: str | None = "relu",
+    ):
         super(MLP, self).__init__()
         if isinstance(hidden_dims, int):
             hidden_dims = [hidden_dims]
@@ -19,45 +84,95 @@ class MLP(nn.Module):
             # 兼容 tuple / 其它可迭代类型，避免 `[input_dim] + hidden_dims`
             # 在 `hidden_dims` 不是 list 时触发类型错误。
             hidden_dims = list(hidden_dims)
-        
-        layer_dims = [input_dim] + hidden_dims + [output_dim]
-        
+        self.layer_dims = [input_dim] + hidden_dims + [output_dim]
+
         self.layers = nn.ModuleList([
-            nn.Linear(layer_dims[i], layer_dims[i + 1])
-            for i in range(len(layer_dims) - 1)
+            nn.Linear(self.layer_dims[i], self.layer_dims[i + 1])
+            for i in range(len(self.layer_dims) - 1)
         ])
         self.output_activation = output_activation
+        self.hidden_activation_name = hidden_activation
+        self.hidden_activation = resolve_activation(hidden_activation)
 
     def forward(self, x):
         for layer in self.layers[:-1]:
-            x = F.relu(layer(x))
+            x = self.hidden_activation(layer(x))
         x = self.layers[-1](x)
         if self.output_activation == 'softmax':
             x = F.softmax(x, dim=1)
         return x
 
+    def as_sequential(self) -> nn.Sequential:
+        """
+        返回一个仅用于结构展示的 `nn.Sequential` 视图。
+        """
+        modules: list[nn.Module] = []
+        for index, layer in enumerate(self.layers):
+            modules.append(layer)
+            is_last = index == len(self.layers) - 1
+            if not is_last:
+                modules.append(build_activation_module(self.hidden_activation_name))
+        if self.output_activation == "softmax":
+            modules.append(nn.Softmax(dim=1))
+        elif self.output_activation not in {None, "none"}:
+            modules.append(build_activation_module(self.output_activation))
+        return nn.Sequential(*modules)
+
 class PolicyNet(nn.Module):
-    def __init__(self, state_dim, hidden_dims, action_dim):
+    def __init__(self, state_dim, hidden_dims, action_dim, hidden_activation: str | None = "relu"):
         super(PolicyNet, self).__init__()
-        self.model = MLP(input_dim=state_dim, hidden_dims=hidden_dims, output_dim=action_dim, output_activation='softmax')
+        self.model = MLP(
+            input_dim=state_dim,
+            hidden_dims=hidden_dims,
+            output_dim=action_dim,
+            output_activation='softmax',
+            hidden_activation=hidden_activation,
+        )
 
     def forward(self, x):
         return self.model(x)
 
 class ValueNet(nn.Module):
-    def __init__(self, state_dim, hidden_dims):
+    def __init__(self, state_dim, hidden_dims, hidden_activation: str | None = "relu"):
         super(ValueNet, self).__init__()
-        self.model = MLP(input_dim=state_dim, hidden_dims=hidden_dims, output_dim=1, output_activation=None)
+        self.model = MLP(
+            input_dim=state_dim,
+            hidden_dims=hidden_dims,
+            output_dim=1,
+            output_activation=None,
+            hidden_activation=hidden_activation,
+        )
 
     def forward(self, x):
         return self.model(x)
 
 class ActorCritic:
-    def __init__(self, state_dim, action_dim, actor_hidden_dims, critic_hidden_dims, actor_lr, critic_lr, gamma, device):
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        actor_hidden_dims,
+        critic_hidden_dims,
+        actor_lr,
+        critic_lr,
+        gamma,
+        device,
+        actor_activation: str | None = "relu",
+        critic_activation: str | None = "relu",
+    ):
         self.device = device
         self.gamma = gamma
-        self.actor = PolicyNet(state_dim, actor_hidden_dims, action_dim).to(device)
-        self.critic = ValueNet(state_dim, critic_hidden_dims).to(device)
+        self.actor = PolicyNet(
+            state_dim,
+            actor_hidden_dims,
+            action_dim,
+            hidden_activation=actor_activation,
+        ).to(device)
+        self.critic = ValueNet(
+            state_dim,
+            critic_hidden_dims,
+            hidden_activation=critic_activation,
+        ).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
 

@@ -371,7 +371,8 @@ class PasistObservationsCfg:
     PASIST 基础观测配置。
 
     当前策略：
-    - policy observation 保持和最小环境一致，方便你复用现有 wrapper 切片逻辑
+    - IsaacLab 原始 policy observation 保持和最小环境一致，方便复用现有 wrapper 切片逻辑
+    - 真正喂给 actor 的输入会在 wrapper 里额外拼接 4 维 skill one-hot command
     - critic observation 额外保留 base_lin_vel，方便上层提 measured velocity
 
     未来扩展方向：

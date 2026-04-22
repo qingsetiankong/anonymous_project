@@ -1,0 +1,47 @@
+reward_weights:
+  task:
+    # 现在训练入口只需要吃 `walk` 这一段。
+    # 后续扩多技能时，再继续往下面补 `crawl / stilt / bipedalize`。
+    walk:
+      # 旧版 upright_posture_reward 的权重。
+      pose_weight: 0.5
+      velocity_weight: 1.0
+      command_weight: 0.0
+      pose_sigma: 0.25
+      velocity_sigma: 0.25
+      height_weight: 0.0
+      height_sigma: 0.05
+
+      # 对应 IsaacLab velocity reward:
+      # - track_ang_vel_z_exp
+      yaw_weight: 0.75
+      yaw_sigma: 0.25
+
+      # 对应 IsaacLab velocity reward:
+      # - lin_vel_z_l2
+      # - ang_vel_xy_l2
+      # - flat_orientation_l2
+      lin_vel_z_weight: -2.0
+      ang_vel_xy_weight: -0.05
+      flat_orientation_weight: -2.5
+
+    crawl: {}
+    stilt: {}
+    bipedalize: {}
+
+  regularization:
+    # 原有基础控制正则
+    action_weight: 1.0e-3  #action_magnitude_penalty
+    smoothness_weight: 1.0e-3  #action_smoothness_penalty
+    stability_weight: 0.0  #posture_stability_penalty
+
+    # 当前工程已经能稳定提取并接入的 KiRAS 风格项
+    joint_acceleration_weight: 2.0e-4  #joint_acceleration_penalty
+    roll_pitch_rate_weight: 5.0e-4  #roll_pitch_rate_penalty
+    yaw_rate_weight: 1.0e-4  #yaw_rate_penalty
+    lateral_velocity_weight: 5.0e-4  #lateral_velocity_penalty
+
+  total:
+    sigma_t: 0.5
+    sigma_sil: 0.6
+    omega_r: 1.0

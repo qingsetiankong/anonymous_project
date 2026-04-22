@@ -2,7 +2,11 @@ from rewards.regularization_reward import (
     action_magnitude_penalty,
     action_smoothness_penalty,
     compute_regularization_reward,
+    joint_acceleration_penalty,
+    lateral_velocity_penalty,
     posture_stability_penalty,
+    roll_pitch_rate_penalty,
+    yaw_rate_penalty,
 )
 from rewards.sil_reward import compute_mean_sil_dtw, compute_sil_reward, compute_sil_weight
 from rewards.task_reward import (
@@ -25,7 +29,11 @@ __all__ = [
     "compute_task_reward",
     "compute_task_weight",
     "compute_total_reward",
+    "joint_acceleration_penalty",
+    "lateral_velocity_penalty",
     "pose_tracking_reward",
     "posture_stability_penalty",
+    "roll_pitch_rate_penalty",
     "velocity_tracking_reward",
+    "yaw_rate_penalty",
 ]

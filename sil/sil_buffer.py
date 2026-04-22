@@ -30,6 +30,7 @@ class SILTrajectory:
     - skill_id: 该轨迹对应的技能类别
     - assessment_score: 轨迹质量分数，通常由 task reward + DTW 共同决定
     - imitation_observations: 用于判别器训练的模仿观测序列
+    - command_onehots: 与每个时刻 imitation observation 对齐的技能 one-hot 序列
     - trajectory: 原始轨迹附加信息，保留给后续分析或调试
     - metadata: 补充元数据，例如 command、episode_id、长度、dtw_distance 等
     """
@@ -37,6 +38,7 @@ class SILTrajectory:
     skill_id: int
     assessment_score: float
     imitation_observations: np.ndarray
+    command_onehots: np.ndarray | None = None
     trajectory: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -79,6 +81,7 @@ class SILBuffer:
         self,
         skill_id: int,
         imitation_observations: np.ndarray,
+        command_onehots: np.ndarray | None,
         assessment_score: float,
         trajectory: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
@@ -98,11 +101,21 @@ class SILBuffer:
         imitation_observations = np.asarray(imitation_observations, dtype=np.float32)
         if imitation_observations.ndim != 2:
             raise ValueError("imitation_observations 必须是二维数组，shape 应为 [T, imitation_obs_dim]")
+        if command_onehots is not None:
+            command_onehots = np.asarray(command_onehots, dtype=np.float32)
+            if command_onehots.ndim != 2:
+                raise ValueError("command_onehots 必须是二维数组，shape 应为 [T, command_dim]")
+            if command_onehots.shape[0] != imitation_observations.shape[0]:
+                raise ValueError(
+                    "command_onehots 与 imitation_observations 的时间长度必须一致，"
+                    f"实际得到 {command_onehots.shape[0]} 和 {imitation_observations.shape[0]}"
+                )
 
         entry = SILTrajectory(
             skill_id=skill_id,
             assessment_score=float(assessment_score),
             imitation_observations=imitation_observations,
+            command_onehots=command_onehots,
             trajectory=trajectory,
             metadata={} if metadata is None else dict(metadata),
         )
@@ -148,10 +161,17 @@ class SILBuffer:
             skill_id = int(_to_numpy(episode["skill_ids"][0], dtype=np.int64).reshape(-1)[0])
 
         imitation_observations = np.asarray([_to_numpy(item, dtype=np.float32).reshape(-1) for item in episode[imitation_key]], dtype=np.float32)
+        command_onehots = None
+        if "command_onehots" in episode and episode["command_onehots"]:
+            command_onehots = np.asarray(
+                [_to_numpy(item, dtype=np.float32).reshape(-1) for item in episode["command_onehots"]],
+                dtype=np.float32,
+            )
 
         return self.add(
             skill_id=skill_id,
             imitation_observations=imitation_observations,
+            command_onehots=command_onehots,
             assessment_score=assessment_score,
             trajectory=episode,
             metadata=metadata,
@@ -192,6 +212,74 @@ class SILBuffer:
             time_index = int(self._rng.integers(entry.length))
             samples.append(entry.imitation_observations[time_index])
         return np.asarray(samples, dtype=np.float32)
+
+    def sample_conditioned(self, batch_size: int, skill_id: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """
+        从 buffer 中采样 imitation observation 及其对应的技能 one-hot。
+
+        返回:
+        - `imitation_observations`: shape = [batch_size, imitation_obs_dim]
+        - `command_onehots`: shape = [batch_size, command_dim]
+        """
+        entries = self._storage.get(int(skill_id), []) if skill_id is not None else self.all_entries()
+        if not entries:
+            raise ValueError("SILBuffer 为空，无法采样")
+
+        imitation_samples = []
+        command_samples = []
+        for _ in range(int(batch_size)):
+            entry = entries[int(self._rng.integers(len(entries)))]
+            if entry.command_onehots is None:
+                raise ValueError("当前 SILTrajectory 未保存 command_onehots，无法构造条件判别器输入")
+            time_index = int(self._rng.integers(entry.length))
+            imitation_samples.append(entry.imitation_observations[time_index])
+            command_samples.append(entry.command_onehots[time_index])
+        return (
+            np.asarray(imitation_samples, dtype=np.float32),
+            np.asarray(command_samples, dtype=np.float32),
+        )
+
+    def sample_transition_conditioned(
+        self,
+        batch_size: int,
+        skill_id: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        从 buffer 中采样相邻时刻的 transition 条件样本。
+
+        返回:
+        - `prev_imitation_observations`: [batch_size, imitation_obs_dim]
+        - `curr_imitation_observations`: [batch_size, imitation_obs_dim]
+        - `prev_command_onehots`: [batch_size, command_dim]
+        - `curr_command_onehots`: [batch_size, command_dim]
+        """
+        entries = self._storage.get(int(skill_id), []) if skill_id is not None else self.all_entries()
+        entries = [
+            entry
+            for entry in entries
+            if entry.length >= 2 and entry.command_onehots is not None
+        ]
+        if not entries:
+            raise ValueError("SILBuffer 中没有可用于 transition 判别器采样的轨迹")
+
+        prev_imitation_samples = []
+        curr_imitation_samples = []
+        prev_command_samples = []
+        curr_command_samples = []
+        for _ in range(int(batch_size)):
+            entry = entries[int(self._rng.integers(len(entries)))]
+            time_index = int(self._rng.integers(1, entry.length))
+            prev_imitation_samples.append(entry.imitation_observations[time_index - 1])
+            curr_imitation_samples.append(entry.imitation_observations[time_index])
+            prev_command_samples.append(entry.command_onehots[time_index - 1])
+            curr_command_samples.append(entry.command_onehots[time_index])
+
+        return (
+            np.asarray(prev_imitation_samples, dtype=np.float32),
+            np.asarray(curr_imitation_samples, dtype=np.float32),
+            np.asarray(prev_command_samples, dtype=np.float32),
+            np.asarray(curr_command_samples, dtype=np.float32),
+        )
 
     def summary(self) -> dict[int, dict[str, float]]:
         """

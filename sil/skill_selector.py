@@ -13,12 +13,13 @@ class SkillCommand:
     字段:
     - velocity: 连续速度命令 v
     - skill_id: 离散技能编号
-    - one_hot: skill_id 对应的 one-hot 编码
+    说明：
+    - one-hot 编码不再由 SkillSelector 内部生成
+    - 训练时统一交给环境侧根据 skill_id 和外部配置解析
     """
 
     velocity: float
     skill_id: int
-    one_hot: np.ndarray
 
 
 class SkillSelector:
@@ -63,14 +64,6 @@ class SkillSelector:
         # reward_sums / counts 用于计算每个 skill 的经验平均 task reward
         self.reward_sums = np.zeros(self.num_skills, dtype=np.float64)
         self.counts = np.zeros(self.num_skills, dtype=np.int64)
-
-    def one_hot(self, skill_id: int) -> np.ndarray:
-        """
-        返回指定技能的 one-hot 编码。
-        """
-        one_hot = np.zeros(self.num_skills, dtype=np.float32)
-        one_hot[int(skill_id)] = 1.0
-        return one_hot
 
     def update(self, skill_id: int, task_reward: float, weight: float = 1.0) -> None:
         """
@@ -146,7 +139,7 @@ class SkillSelector:
 
     def sample_command(self, skill_id: int | None = None) -> SkillCommand:
         """
-        采样一个完整 command = (velocity, skill_id, one_hot)。
+        采样一个完整 command = (velocity, skill_id)。
 
         参数:
         - skill_id: 若传入则固定技能；否则根据 selector 当前策略自动采样
@@ -156,7 +149,6 @@ class SkillSelector:
         return SkillCommand(
             velocity=velocity,
             skill_id=chosen_skill,
-            one_hot=self.one_hot(chosen_skill),
         )
 
     def summary(self) -> dict[str, list[float]]:

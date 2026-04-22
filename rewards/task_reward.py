@@ -119,10 +119,11 @@ def pose_tracking_reward(
 
 
 def upright_posture_reward(
-    imitation_observation: Any,
+    imitation_observation: Any | None = None,
     sigma: float = 0.25,
     projected_gravity_slice: tuple[int, int] = (3, 6),
     upright_reference: tuple[float, float, float] = (0.0, 0.0, -1.0),
+    projected_gravity: Any | None = None,
 ) -> float | np.ndarray:
     """
     计算机身直立奖励。
@@ -145,15 +146,20 @@ def upright_posture_reward(
     - 单样本时为 `float`
     - batched 时为 shape = [B] 的 `np.ndarray`
     """
-    observation = _as_float_vector_or_batch(imitation_observation)
-    start, end = projected_gravity_slice
-    if observation.shape[-1] < end:
-        raise ValueError(
-            "imitation_observation 维度不足，无法提取 projected_gravity；"
-            f"需要至少到索引 {end}，实际为 {observation.shape[-1]}"
-        )
+    if projected_gravity is None:
+        if imitation_observation is None:
+            raise ValueError("upright_posture_reward 需要 imitation_observation 或 projected_gravity 之一")
+        observation = _as_float_vector_or_batch(imitation_observation)
+        start, end = projected_gravity_slice
+        if observation.shape[-1] < end:
+            raise ValueError(
+                "imitation_observation 维度不足，无法提取 projected_gravity；"
+                f"需要至少到索引 {end}，实际为 {observation.shape[-1]}"
+            )
+        projected_gravity = observation[..., start:end]
+    else:
+        projected_gravity = _as_float_vector_or_batch(projected_gravity)
 
-    projected_gravity = observation[..., start:end]
     reference = np.asarray(upright_reference, dtype=np.float32)
     error = np.linalg.norm(projected_gravity - reference, axis=-1 if projected_gravity.ndim >= 2 else 0)
     reward = np.exp(-error / max(float(sigma), 1e-6)).astype(np.float32, copy=False)
@@ -188,6 +194,96 @@ def velocity_tracking_reward(
     error = np.abs(commanded - measured)
     reward = np.exp(-error / max(float(sigma), 1e-6)).astype(np.float32, copy=False)
     return _maybe_scalar(reward)
+
+
+def velocity_tracking_xy_exp_reward(
+    commanded_linear_velocity_xy: Any,
+    measured_linear_velocity_xy: Any,
+    std: float = 0.5,
+) -> float | np.ndarray:
+    """
+    复刻 IsaacLab `track_lin_vel_xy_exp` 的指数核速度跟踪奖励。
+
+    公式:
+    - `exp(-||v_cmd_xy - v_meas_xy||^2 / std^2)`
+    """
+    commanded = _as_float_vector_or_batch(commanded_linear_velocity_xy)
+    measured = _as_float_vector_or_batch(measured_linear_velocity_xy)
+    if commanded.shape != measured.shape:
+        if measured.ndim >= 2 and commanded.ndim == 1 and measured.shape[-1] == commanded.shape[-1]:
+            commanded = np.broadcast_to(commanded, measured.shape)
+        else:
+            raise ValueError("commanded_linear_velocity_xy 和 measured_linear_velocity_xy 的维度必须一致")
+
+    error = np.sum(np.square(commanded - measured), axis=-1 if measured.ndim >= 2 else 0)
+    reward = np.exp(-error / max(float(std) ** 2, 1e-6)).astype(np.float32, copy=False)
+    return _maybe_scalar(reward)
+
+
+def yaw_tracking_exp_reward(
+    commanded_yaw_rate: float | np.ndarray,
+    measured_yaw_rate: float | np.ndarray,
+    std: float = 0.5,
+) -> float | np.ndarray:
+    """
+    复刻 IsaacLab `track_ang_vel_z_exp` 的指数核 yaw 跟踪奖励。
+    """
+    commanded = _as_float_array(commanded_yaw_rate)
+    measured = _as_float_array(measured_yaw_rate)
+    error = np.square(commanded - measured)
+    reward = np.exp(-error / max(float(std) ** 2, 1e-6)).astype(np.float32, copy=False)
+    return _maybe_scalar(reward)
+
+
+def linear_velocity_z_l2_penalty(measured_linear_velocity: Any) -> float | np.ndarray:
+    """
+    复刻 IsaacLab `lin_vel_z_l2` 的竖直速度惩罚。
+    """
+    velocity = _as_float_vector_or_batch(measured_linear_velocity)
+    if velocity.shape[-1] < 3:
+        raise ValueError("measured_linear_velocity 至少需要包含 xyz 三个分量")
+    penalty = np.square(velocity[..., 2])
+    return _maybe_scalar(penalty)
+
+
+def angular_velocity_xy_l2_penalty(measured_angular_velocity: Any) -> float | np.ndarray:
+    """
+    复刻 IsaacLab `ang_vel_xy_l2` 的 roll / pitch 角速度惩罚。
+    """
+    angular_velocity = _as_float_vector_or_batch(measured_angular_velocity)
+    if angular_velocity.shape[-1] < 2:
+        raise ValueError("measured_angular_velocity 至少需要包含 x/y 两个分量")
+    penalty = np.sum(np.square(angular_velocity[..., :2]), axis=-1 if angular_velocity.ndim >= 2 else 0)
+    return _maybe_scalar(penalty)
+
+
+def flat_orientation_l2_penalty(
+    imitation_observation: Any | None = None,
+    projected_gravity_slice: tuple[int, int] = (3, 6),
+    projected_gravity: Any | None = None,
+) -> float | np.ndarray:
+    """
+    复刻 IsaacLab `flat_orientation_l2` 的机身水平姿态惩罚。
+
+    当前 imitation observation 中 `[3:6]` 对应 projected_gravity。
+    该项直接惩罚其 x/y 分量平方和。
+    """
+    if projected_gravity is None:
+        if imitation_observation is None:
+            raise ValueError("flat_orientation_l2_penalty 需要 imitation_observation 或 projected_gravity 之一")
+        observation = _as_float_vector_or_batch(imitation_observation)
+        start, end = projected_gravity_slice
+        if observation.shape[-1] < end:
+            raise ValueError(
+                "imitation_observation 维度不足，无法提取 projected_gravity；"
+                f"需要至少到索引 {end}，实际为 {observation.shape[-1]}"
+            )
+        projected_gravity = observation[..., start:end]
+    else:
+        projected_gravity = _as_float_vector_or_batch(projected_gravity)
+
+    penalty = np.sum(np.square(projected_gravity[..., :2]), axis=-1 if projected_gravity.ndim >= 2 else 0)
+    return _maybe_scalar(penalty)
 
 
 def yaw_tracking_reward(
@@ -257,6 +353,9 @@ def compute_walk_task_reward(
     imitation_observation: Any,
     commanded_velocity: float | np.ndarray,
     measured_velocity: float | np.ndarray,
+    measured_linear_velocity: Any | None = None,
+    measured_angular_velocity: Any | None = None,
+    projected_gravity: Any | None = None,
     posture_weight: float = 0.5,
     velocity_weight: float = 1.0,
     posture_sigma: float = 0.25,
@@ -265,6 +364,9 @@ def compute_walk_task_reward(
     measured_yaw_rate: float | np.ndarray | None = None,
     yaw_weight: float = 0.0,
     yaw_sigma: float = 0.25,
+    lin_vel_z_weight: float = 0.0,
+    ang_vel_xy_weight: float = 0.0,
+    flat_orientation_weight: float = 0.0,
     base_height: float | np.ndarray | None = None,
     target_base_height: float | np.ndarray | None = None,
     height_weight: float = 0.0,
@@ -274,36 +376,46 @@ def compute_walk_task_reward(
     计算当前单技能 `walk` 的 task reward。
 
     设计原则:
-    - 更贴近 PASIST 论文里“按 skill 手工设计 r_T”的思路
-    - `walk` 的 `r_T` 主要关注任务本身：
-      - 跟随速度命令前进
-      - 保持直立、稳定
-    - 不把整帧 target pose 匹配塞进 `r_T`
-      - target pose / DTW 的作用主要留给轨迹筛选与 SIL
+    - 保持 PASIST 的“trainer 自己重算 r_T”结构
+    - 但对 `walk` 采用更贴近 IsaacLab velocity locomotion 的项
+    - 把 `target_pose` 继续留给 DTW / SIL，不塞进 walk 的主任务奖励
 
-    当前默认启用的两项:
-    - `velocity_tracking_reward`
-    - `upright_posture_reward`
-
-    预留但默认关闭的两项:
-    - `yaw_tracking_reward`
-    - `base_height_reward`
+    当前优先采用的官方同款项:
+    - `track_lin_vel_xy_exp`
+    - `track_ang_vel_z_exp`
+    - `lin_vel_z_l2`
+    - `ang_vel_xy_l2`
+    - `flat_orientation_l2`
     """
-    reward = np.asarray(
-        float(velocity_weight)
-        * velocity_tracking_reward(
-            commanded_velocity=commanded_velocity,
-            measured_velocity=measured_velocity,
-            sigma=velocity_sigma,
-        ),
-        dtype=np.float32,
+    if measured_linear_velocity is None:
+        measured_linear_velocity_xy = np.stack(
+            [
+                _as_float_array(measured_velocity),
+                np.zeros_like(_as_float_array(measured_velocity), dtype=np.float32),
+            ],
+            axis=-1,
+        )
+    else:
+        linear_velocity = _as_float_vector_or_batch(measured_linear_velocity)
+        if linear_velocity.shape[-1] < 2:
+            raise ValueError("measured_linear_velocity 至少需要包含 x/y 两个分量")
+        measured_linear_velocity_xy = linear_velocity[..., :2]
+
+    commanded_velocity_array = _as_float_array(commanded_velocity)
+    commanded_linear_velocity_xy = np.stack(
+        [
+            commanded_velocity_array,
+            np.zeros_like(commanded_velocity_array, dtype=np.float32),
+        ],
+        axis=-1,
     )
 
-    reward = reward + np.asarray(
-        float(posture_weight)
-        * upright_posture_reward(
-            imitation_observation=imitation_observation,
-            sigma=posture_sigma,
+    reward = np.asarray(
+        float(velocity_weight)
+        * velocity_tracking_xy_exp_reward(
+            commanded_linear_velocity_xy=commanded_linear_velocity_xy,
+            measured_linear_velocity_xy=measured_linear_velocity_xy,
+            std=velocity_sigma,
         ),
         dtype=np.float32,
     )
@@ -315,10 +427,50 @@ def compute_walk_task_reward(
     ):
         reward = reward + np.asarray(
             float(yaw_weight)
-            * yaw_tracking_reward(
+            * yaw_tracking_exp_reward(
                 commanded_yaw_rate=commanded_yaw_rate,
                 measured_yaw_rate=measured_yaw_rate,
-                sigma=yaw_sigma,
+                std=yaw_sigma,
+            ),
+            dtype=np.float32,
+        )
+
+    if lin_vel_z_weight != 0.0 and measured_linear_velocity is not None:
+        reward = reward + np.asarray(
+            float(lin_vel_z_weight)
+            * linear_velocity_z_l2_penalty(
+                measured_linear_velocity=measured_linear_velocity,
+            ),
+            dtype=np.float32,
+        )
+
+    if ang_vel_xy_weight != 0.0 and measured_angular_velocity is not None:
+        reward = reward + np.asarray(
+            float(ang_vel_xy_weight)
+            * angular_velocity_xy_l2_penalty(
+                measured_angular_velocity=measured_angular_velocity,
+            ),
+            dtype=np.float32,
+        )
+
+    if flat_orientation_weight != 0.0:
+        reward = reward + np.asarray(
+            float(flat_orientation_weight)
+            * flat_orientation_l2_penalty(
+                imitation_observation=imitation_observation,
+                projected_gravity=projected_gravity,
+            ),
+            dtype=np.float32,
+        )
+
+    # 为了不破坏旧实验，保留原来的直立奖励接口。
+    if posture_weight != 0.0:
+        reward = reward + np.asarray(
+            float(posture_weight)
+            * upright_posture_reward(
+                imitation_observation=imitation_observation,
+                sigma=posture_sigma,
+                projected_gravity=projected_gravity,
             ),
             dtype=np.float32,
         )
@@ -346,6 +498,9 @@ def compute_task_reward(
     target_pose: Any,
     commanded_velocity: float | np.ndarray | None = None,
     measured_velocity: float | np.ndarray | None = None,
+    measured_linear_velocity: Any | None = None,
+    measured_angular_velocity: Any | None = None,
+    projected_gravity: Any | None = None,
     skill_id: int | np.ndarray | None = None,
     command_skill_id: int | np.ndarray | None = None,
     pose_weight: float = 1.0,
@@ -357,6 +512,9 @@ def compute_task_reward(
     measured_yaw_rate: float | np.ndarray | None = None,
     yaw_weight: float = 0.0,
     yaw_sigma: float = 0.25,
+    lin_vel_z_weight: float = 0.0,
+    ang_vel_xy_weight: float = 0.0,
+    flat_orientation_weight: float = 0.0,
     base_height: float | np.ndarray | None = None,
     target_base_height: float | np.ndarray | None = None,
     height_weight: float = 0.0,
@@ -403,6 +561,9 @@ def compute_task_reward(
             imitation_observation=imitation_observation,
             commanded_velocity=0.0 if commanded_velocity is None else commanded_velocity,
             measured_velocity=0.0 if measured_velocity is None else measured_velocity,
+            measured_linear_velocity=measured_linear_velocity,
+            measured_angular_velocity=measured_angular_velocity,
+            projected_gravity=projected_gravity,
             posture_weight=pose_weight,
             velocity_weight=velocity_weight,
             posture_sigma=pose_sigma,
@@ -411,6 +572,9 @@ def compute_task_reward(
             measured_yaw_rate=measured_yaw_rate,
             yaw_weight=yaw_weight,
             yaw_sigma=yaw_sigma,
+            lin_vel_z_weight=lin_vel_z_weight,
+            ang_vel_xy_weight=ang_vel_xy_weight,
+            flat_orientation_weight=flat_orientation_weight,
             base_height=base_height,
             target_base_height=target_base_height,
             height_weight=height_weight,

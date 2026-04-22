@@ -36,11 +36,17 @@ def compute_sil_weight(mean_dtw_distance: float, sigma_sil: float, num_skills: i
 
     按 PASIST 原文 Eq. (7) 的含义实现：
 
-    omega_SIL = exp(-(mean_dtw_distance - sigma_sil))
+    omega_SIL = exp(-|mean_dtw_distance - sigma_sil|)
 
     这里的 `mean_dtw_distance` 约定为：
     - 已经对所有 skill 做过平均的全局 DTW 统计
     - 也就是等价于论文中的 `(1 / N_m) * sum_p E[dDTW(...)]`
+
+    说明:
+    - 原文这里同样是范数/绝对值形式
+    - 对当前标量 mean DTW 的工程实现，等价使用
+      `abs(mean_dtw_distance - sigma_sil)`
+    - 因此 `omega_SIL` 会稳定落在 `(0, 1]`
 
     因此，虽然函数签名中仍然保留 `num_skills` 参数以兼容现有调用链，
     但当前实现不会再次除以 `num_skills`，避免重复平均。
@@ -65,7 +71,7 @@ def compute_sil_weight(mean_dtw_distance: float, sigma_sil: float, num_skills: i
     if not np.isfinite(float(mean_dtw_distance)):
         return 0.0
     del num_skills
-    return float(np.exp(-(float(mean_dtw_distance) - float(sigma_sil))))
+    return float(np.exp(-abs(float(mean_dtw_distance) - float(sigma_sil))))
 
 
 def compute_mean_sil_dtw(summary_by_skill: dict[int, dict[str, float]]) -> float:

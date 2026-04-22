@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -58,6 +59,8 @@ class PPOTrainerConfig:
     # policy / value 网络结构
     actor_hidden_dims: tuple[int, ...] = (256, 256)
     critic_hidden_dims: tuple[int, ...] = (256, 256)
+    actor_activation: str = "relu"
+    critic_activation: str = "relu"
     init_log_std: float = -0.5
 
     # task reward 相关超参数
@@ -66,11 +69,22 @@ class PPOTrainerConfig:
     command_weight: float = 0.0
     pose_sigma: float = 1.0
     velocity_sigma: float = 0.25
+    yaw_weight: float = 0.0
+    yaw_sigma: float = 0.25
+    lin_vel_z_weight: float = 0.0
+    ang_vel_xy_weight: float = 0.0
+    flat_orientation_weight: float = 0.0
+    height_weight: float = 0.0
+    height_sigma: float = 0.05
 
     # regularization reward 相关超参数
     action_weight: float = 1.0e-3
     smoothness_weight: float = 1.0e-3
     stability_weight: float = 0.0
+    joint_acceleration_weight: float = 0.0
+    roll_pitch_rate_weight: float = 0.0
+    yaw_rate_weight: float = 0.0
+    lateral_velocity_weight: float = 0.0
 
     # total reward 动态权重相关超参数
     sigma_t: float = 0.5
@@ -102,13 +116,21 @@ class GaussianPolicy(nn.Module):
     - log_std 是可学习的全局参数，shape = [action_dim]
     """
 
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dims, init_log_std: float = -0.5) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dims,
+        init_log_std: float = -0.5,
+        hidden_activation: str = "relu",
+    ) -> None:
         super().__init__()
         self.mean_net = MLP(
             input_dim=obs_dim,
             hidden_dims=hidden_dims,
             output_dim=action_dim,
             output_activation=None,
+            hidden_activation=hidden_activation,
         )
         self.log_std = nn.Parameter(torch.full((action_dim,), float(init_log_std), dtype=torch.float32))
 
@@ -154,13 +176,14 @@ class ValueFunction(nn.Module):
     PPO 中的状态价值网络 V(s)。
     """
 
-    def __init__(self, obs_dim: int, hidden_dims) -> None:
+    def __init__(self, obs_dim: int, hidden_dims, hidden_activation: str = "relu") -> None:
         super().__init__()
         self.value_net = MLP(
             input_dim=obs_dim,
             hidden_dims=hidden_dims,
             output_dim=1,
             output_activation=None,
+            hidden_activation=hidden_activation,
         )
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
@@ -204,10 +227,12 @@ class PPOTrainer:
             action_dim=env.action_dim,
             hidden_dims=self.config.actor_hidden_dims,
             init_log_std=self.config.init_log_std,
+            hidden_activation=self.config.actor_activation,
         ).to(self.device)
         self.value_function = ValueFunction(
             obs_dim=env.obs_dim,
             hidden_dims=self.config.critic_hidden_dims,
+            hidden_activation=self.config.critic_activation,
         ).to(self.device)
 
         self.actor_optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.config.actor_lr)
@@ -248,16 +273,22 @@ class PPOTrainer:
             config_path = Path(self.config.discriminator_config_path)
             if config_path.exists():
                 self.discriminator = SILDiscriminator.from_yaml(
-                    input_dim=env.imitation_obs_dim,
+                    input_dim=self._infer_discriminator_input_dim(),
                     config_path=config_path,
                 ).to(self.device)
                 self.discriminator_optimizer = self.discriminator.build_optimizer(config_path=config_path)
+
+        # 判别器只看 joint_pos_rel，因此这里给它单独做一个固定尺度归一化。
+        # 选 0.25 rad 的原因是与关节位置动作项的 scale 保持一致，
+        # 让“关节相对默认姿态”的数值量级更统一，减轻不同关节幅值差异。
+        self._discriminator_joint_pos_scale = 0.25
 
         self._current_obs: np.ndarray | None = None
         self._current_info: dict[str, Any] | None = None
         self._current_command: PasistCommand | None = None
         self._previous_action = np.zeros((self.num_envs, env.action_dim), dtype=np.float32)
         self._episode_ids = np.zeros(self.num_envs, dtype=np.int64)
+        self.total_env_steps = 0
 
     def train(
         self,
@@ -299,12 +330,22 @@ class PPOTrainer:
         4. 可选：更新 discriminator
         5. 清空 rollout buffer
         """
+        iteration_start_time = time.perf_counter()
         if self._current_obs is None:
             self._reset_env_with_new_command(seed=seed)
 
+        collection_start_time = time.perf_counter()
         rollout_stats = self.collect_rollout()
+        collection_time = time.perf_counter() - collection_start_time
+
+        learning_start_time = time.perf_counter()
         ppo_stats = self.update_policy()
         sil_stats = self.update_sil_components()
+        learning_time = time.perf_counter() - learning_start_time
+
+        iteration_time = time.perf_counter() - iteration_start_time
+        rollout_steps = int(self.config.num_steps * self.num_envs)
+        self.total_env_steps += rollout_steps
 
         self.rollout_buffer.clear()
 
@@ -312,6 +353,17 @@ class PPOTrainer:
         merged.update(rollout_stats)
         merged.update(ppo_stats)
         merged.update(sil_stats)
+        merged.update(
+            {
+                "iteration_collection_time_sec": float(collection_time),
+                "iteration_learning_time_sec": float(learning_time),
+                "iteration_total_time_sec": float(iteration_time),
+                "iteration_steps_per_sec": float(rollout_steps / max(iteration_time, 1.0e-8)),
+                "iteration_env_steps": float(rollout_steps),
+                "total_env_steps": float(self.total_env_steps),
+                "mean_action_noise_std": float(torch.exp(self.policy.log_std).mean().item()),
+            }
+        )
         return merged
 
     def collect_rollout(self) -> dict[str, float]:
@@ -547,22 +599,90 @@ class PPOTrainer:
             "sil_buffer_num_trajectories": float(len(self.sil_buffer)),
             "sil_buffer_mean_dtw": float(compute_mean_sil_dtw(summary)),
         }
+        stats.update(self._summarize_episode_metrics(episodes))
         stats.update(discriminator_stats)
         return stats
 
+    def _summarize_episode_metrics(self, episodes: list[dict[str, Any]]) -> dict[str, float]:
+        """
+        汇总 rollout 中 episode 级别的奖励与长度统计。
+
+        优先使用本轮已完成的 episode；如果一轮内没有完整结束的 episode，
+        则退化为使用当前收集到的片段，避免控制台输出完全空白。
+        """
+        if not episodes:
+            return {}
+
+        completed_episodes = []
+        for episode in episodes:
+            if not episode.get("dones"):
+                continue
+            done_flag = float(self._to_numpy(episode["dones"][-1]).reshape(-1)[0])
+            if done_flag > 0.5:
+                completed_episodes.append(episode)
+
+        target_episodes = completed_episodes if completed_episodes else episodes
+        if not target_episodes:
+            return {}
+
+        total_returns = []
+        task_returns = []
+        reg_returns = []
+        sil_returns = []
+        lengths = []
+
+        for episode in target_episodes:
+            reward_total = np.asarray(
+                [self._to_numpy(item, dtype=np.float32).reshape(-1)[0] for item in episode["reward_total"]],
+                dtype=np.float32,
+            )
+            reward_task = np.asarray(
+                [self._to_numpy(item, dtype=np.float32).reshape(-1)[0] for item in episode["reward_task"]],
+                dtype=np.float32,
+            )
+            reward_reg = np.asarray(
+                [self._to_numpy(item, dtype=np.float32).reshape(-1)[0] for item in episode["reward_reg"]],
+                dtype=np.float32,
+            )
+            reward_sil = np.asarray(
+                [self._to_numpy(item, dtype=np.float32).reshape(-1)[0] for item in episode["reward_sil"]],
+                dtype=np.float32,
+            )
+
+            total_returns.append(float(reward_total.sum()))
+            task_returns.append(float(reward_task.sum()))
+            reg_returns.append(float(reward_reg.sum()))
+            sil_returns.append(float(reward_sil.sum()))
+            lengths.append(float(len(reward_total)))
+
+        return {
+            "episode_reward_mean": float(np.mean(total_returns)),
+            "episode_reward_task_mean": float(np.mean(task_returns)),
+            "episode_reward_reg_mean": float(np.mean(reg_returns)),
+            "episode_reward_sil_mean": float(np.mean(sil_returns)),
+            "episode_length_mean": float(np.mean(lengths)),
+            "episode_count": float(len(target_episodes)),
+            "completed_episode_count": float(len(completed_episodes)),
+        }
+
     def update_discriminator(self) -> dict[str, float]:
         """
-        如果开启 SIL 且判别器可用，则用当前 rollout 中的 imitation_obs 更新判别器。
+        如果开启 SIL 且判别器可用，则用当前 rollout 中的
+        transition 条件输入 `(x_{t-1}, x_t)` 更新判别器。
         """
         if not self.config.enable_sil:
             return {}
         if self.discriminator is None or self.discriminator_optimizer is None:
             return {}
-        if len(self.sil_buffer) == 0 or self.rollout_buffer.imitation_obs is None:
+        if (
+            len(self.sil_buffer) == 0
+            or self.rollout_buffer.imitation_obs is None
+            or self.rollout_buffer.command_onehots is None
+        ):
             return {}
 
-        valid_policy_samples = self.rollout_buffer._flatten_valid(self.rollout_buffer.imitation_obs)
-        if valid_policy_samples.numel() == 0:
+        policy_transition_inputs = self._collect_policy_transition_inputs_from_rollout()
+        if policy_transition_inputs is None or policy_transition_inputs.numel() == 0:
             return {}
 
         expert_score_sum = 0.0
@@ -571,18 +691,36 @@ class PPOTrainer:
         loss_sum = 0.0
         num_updates = 0
 
-        batch_size = min(self.config.discriminator_batch_size, valid_policy_samples.shape[0])
+        batch_size = min(self.config.discriminator_batch_size, policy_transition_inputs.shape[0])
         for _ in range(self.config.discriminator_updates_per_iteration):
-            expert_samples = self.sil_buffer.sample(batch_size=batch_size)
-            expert_tensor = torch.as_tensor(expert_samples, dtype=torch.float32, device=self.device)
+            (
+                expert_prev_imitation,
+                expert_curr_imitation,
+                expert_prev_command_onehots,
+                expert_curr_command_onehots,
+            ) = self.sil_buffer.sample_transition_conditioned(batch_size=batch_size)
+            expert_tensor = self._compose_discriminator_transition_torch_inputs(
+                prev_imitation_obs=torch.as_tensor(expert_prev_imitation, dtype=torch.float32, device=self.device),
+                curr_imitation_obs=torch.as_tensor(expert_curr_imitation, dtype=torch.float32, device=self.device),
+                prev_command_onehot=torch.as_tensor(
+                    expert_prev_command_onehots,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                curr_command_onehot=torch.as_tensor(
+                    expert_curr_command_onehots,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            )
 
             sample_indices = torch.randint(
                 low=0,
-                high=valid_policy_samples.shape[0],
+                high=policy_transition_inputs.shape[0],
                 size=(batch_size,),
                 device=self.device,
             )
-            policy_tensor = valid_policy_samples[sample_indices]
+            policy_tensor = policy_transition_inputs[sample_indices]
 
             loss, stats = self.discriminator.compute_loss(
                 expert_samples=expert_tensor,
@@ -655,12 +793,34 @@ class PPOTrainer:
         imitation_obs = self._ensure_batch_matrix(info["imitation_obs"], self.env.imitation_obs_dim)
         target_pose = np.asarray(info["target_pose"], dtype=np.float32)
         measured_velocity = info.get("measured_velocity", 0.0)
+        base_height = info.get("base_height", None)
+        base_pitch = info.get("base_pitch", None)
+        current_critic_obs = self._ensure_batch_feature_array(info.get("critic_obs"), fallback=next_observation)
+        previous_critic_obs = self._ensure_batch_feature_array(
+            self._current_info.get("critic_obs") if self._current_info is not None else None,
+            fallback=None,
+        )
+
+        base_angular_velocity = self._extract_base_angular_velocity(current_critic_obs)
+        base_linear_velocity = self._extract_base_linear_velocity(current_critic_obs)
+        projected_gravity = self._extract_projected_gravity(current_critic_obs)
+        measured_yaw_rate = base_angular_velocity[:, 2]
+        joint_velocity = self._extract_joint_velocity(current_critic_obs)
+        previous_joint_velocity = (
+            self._extract_joint_velocity(previous_critic_obs) if previous_critic_obs is not None else None
+        )
+        lateral_velocity = self._extract_lateral_velocity(current_critic_obs)
+
+        target_base_height = self._extract_target_pose_base_height(target_pose)
 
         task_reward = compute_task_reward(
             imitation_observation=imitation_obs,
             target_pose=target_pose,
             commanded_velocity=active_command.velocity,
             measured_velocity=measured_velocity,
+            measured_linear_velocity=base_linear_velocity,
+            measured_angular_velocity=base_angular_velocity,
+            projected_gravity=projected_gravity,
             skill_id=self._build_skill_id_vector(active_command.skill_id),
             command_skill_id=self._build_skill_id_vector(active_command.skill_id),
             pose_weight=self.config.pose_weight,
@@ -668,6 +828,17 @@ class PPOTrainer:
             command_weight=self.config.command_weight,
             pose_sigma=self.config.pose_sigma,
             velocity_sigma=self.config.velocity_sigma,
+            commanded_yaw_rate=0.0,
+            measured_yaw_rate=measured_yaw_rate,
+            yaw_weight=self.config.yaw_weight,
+            yaw_sigma=self.config.yaw_sigma,
+            lin_vel_z_weight=self.config.lin_vel_z_weight,
+            ang_vel_xy_weight=self.config.ang_vel_xy_weight,
+            flat_orientation_weight=self.config.flat_orientation_weight,
+            base_height=base_height,
+            target_base_height=target_base_height,
+            height_weight=self.config.height_weight,
+            height_sigma=self.config.height_sigma,
         )
 
         regularization_reward = compute_regularization_reward(
@@ -678,9 +849,29 @@ class PPOTrainer:
             action_weight=self.config.action_weight,
             smoothness_weight=self.config.smoothness_weight,
             stability_weight=self.config.stability_weight,
+            joint_velocity=joint_velocity,
+            previous_joint_velocity=previous_joint_velocity,
+            joint_acceleration_weight=self.config.joint_acceleration_weight,
+            base_angular_velocity=base_angular_velocity,
+            roll_pitch_rate_weight=self.config.roll_pitch_rate_weight,
+            yaw_rate_weight=self.config.yaw_rate_weight,
+            lateral_velocity=lateral_velocity,
+            lateral_velocity_weight=self.config.lateral_velocity_weight,
         )
 
-        sil_reward = self._compute_sil_reward(imitation_obs)
+        command_onehot_batch = self._build_command_onehot_batch(active_command.one_hot)
+        previous_imitation_obs = None
+        if self._current_info is not None and "imitation_obs" in self._current_info:
+            previous_imitation_obs = self._ensure_batch_matrix(
+                self._current_info["imitation_obs"],
+                self.env.imitation_obs_dim,
+            )
+        sil_reward = self._compute_sil_reward(
+            previous_imitation_obs=previous_imitation_obs,
+            current_imitation_obs=imitation_obs,
+            previous_command_onehot=command_onehot_batch,
+            current_command_onehot=command_onehot_batch,
+        )
         omega_sil = self._compute_omega_sil()
 
         return compute_reward_terms(
@@ -692,18 +883,33 @@ class PPOTrainer:
             omega_r=self.config.omega_r,
         )
 
-    def _compute_sil_reward(self, imitation_obs: np.ndarray) -> float | np.ndarray:
+    def _compute_sil_reward(
+        self,
+        previous_imitation_obs: np.ndarray | None,
+        current_imitation_obs: np.ndarray,
+        previous_command_onehot: np.ndarray,
+        current_command_onehot: np.ndarray,
+    ) -> float | np.ndarray:
         """
         计算当前 step 的 SIL reward。
 
         如果判别器或 SIL buffer 还不可用，则安全地返回 0。
+        当前 `r_SIL` 使用 transition 条件输入 `(x_{t-1}, x_t)`。
         """
         if not self.config.enable_sil:
             return np.zeros(self.num_envs, dtype=np.float32) if self.num_envs > 1 else 0.0
         if self.discriminator is None or len(self.sil_buffer) == 0:
             return np.zeros(self.num_envs, dtype=np.float32) if self.num_envs > 1 else 0.0
+        if previous_imitation_obs is None:
+            return np.zeros(self.num_envs, dtype=np.float32) if self.num_envs > 1 else 0.0
 
-        imitation_tensor = torch.as_tensor(imitation_obs, dtype=torch.float32, device=self.device)
+        discriminator_inputs = self._compose_discriminator_transition_numpy_inputs(
+            prev_imitation_obs=previous_imitation_obs,
+            curr_imitation_obs=current_imitation_obs,
+            prev_command_onehot=previous_command_onehot,
+            curr_command_onehot=current_command_onehot,
+        )
+        imitation_tensor = torch.as_tensor(discriminator_inputs, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             sil_reward = self.discriminator.sil_reward(imitation_tensor).detach().cpu().numpy().astype(np.float32)
         if self.num_envs == 1 and sil_reward.shape[0] == 1:
@@ -778,6 +984,241 @@ class PPOTrainer:
         if array.shape[1] != feature_dim:
             raise ValueError(f"特征维不匹配，期望 {feature_dim}，实际得到 {array.shape[1]}")
         return array.astype(np.float32, copy=False)
+
+    def _ensure_batch_feature_array(self, value: Any, fallback: Any | None = None) -> np.ndarray | None:
+        """
+        将任意特征数组整理成 `[num_envs, D]`。
+
+        这个辅助函数用于处理 `critic_obs` 这类“维度不一定等于 policy obs_dim”的输入，
+        因此不能复用 `_ensure_batch_observation()`。
+        """
+        source = fallback if value is None else value
+        if source is None:
+            return None
+
+        array = self._to_numpy(source, dtype=np.float32)
+        if array.ndim == 1:
+            array = array.reshape(1, -1)
+        elif array.ndim != 2:
+            raise ValueError(f"期望二维数组 [B, D]，实际得到 shape={array.shape}")
+
+        if array.shape[0] != self.num_envs:
+            if array.shape[0] == 1 and self.num_envs > 1:
+                array = np.repeat(array, self.num_envs, axis=0)
+            else:
+                raise ValueError(f"batch 维不匹配，期望 {self.num_envs}，实际为 {array.shape[0]}")
+        return array.astype(np.float32, copy=False)
+
+    def _extract_base_angular_velocity(self, critic_obs: np.ndarray | None) -> np.ndarray | None:
+        """
+        从当前最小 critic observation 中提取未缩放的 `base_ang_vel`。
+
+        约定:
+        - `[3:6]` 对应 `base_ang_vel`
+        - 当前观测缩放是 0.2，因此这里做一次反缩放
+        """
+        if critic_obs is None or critic_obs.shape[1] < 6:
+            return None
+        return critic_obs[:, 3:6].astype(np.float32, copy=False) / 0.2
+
+    def _extract_base_linear_velocity(self, critic_obs: np.ndarray | None) -> np.ndarray | None:
+        """
+        从当前最小 critic observation 中提取 `base_lin_vel`。
+
+        约定:
+        - `[0:3]` 对应未缩放的 `base_lin_vel`
+        """
+        if critic_obs is None or critic_obs.shape[1] < 3:
+            return None
+        return critic_obs[:, 0:3].astype(np.float32, copy=False)
+
+    def _extract_joint_velocity(self, critic_obs: np.ndarray | None) -> np.ndarray | None:
+        """
+        从当前最小 critic observation 中提取未缩放的 `joint_vel_rel`。
+
+        约定:
+        - `[24:36]` 对应 12 维关节速度
+        - 当前观测缩放是 0.05，因此这里做一次反缩放
+        """
+        if critic_obs is None or critic_obs.shape[1] < 36:
+            return None
+        return critic_obs[:, 24:36].astype(np.float32, copy=False) / 0.05
+
+    def _extract_projected_gravity(self, critic_obs: np.ndarray | None) -> np.ndarray | None:
+        """
+        从当前最小 critic observation 中提取 `projected_gravity`。
+
+        约定:
+        - `[6:9]` 对应 `projected_gravity`
+        """
+        if critic_obs is None or critic_obs.shape[1] < 9:
+            return None
+        return critic_obs[:, 6:9].astype(np.float32, copy=False)
+
+    def _extract_lateral_velocity(self, critic_obs: np.ndarray | None) -> np.ndarray | None:
+        """
+        从 critic observation 中提取基座 y 向线速度。
+        """
+        if critic_obs is None or critic_obs.shape[1] < 2:
+            return None
+        return critic_obs[:, 1].astype(np.float32, copy=False)
+
+    def _extract_target_pose_base_height(self, target_pose: Any) -> float | np.ndarray | None:
+        """
+        从 target pose 中提取目标 base height。
+
+        当前 pose-only target pose 约定:
+        - 第 0 维为 base_height
+        - 第 1:13 维为 joint_pos_rel
+        - 第 13 维为 skill_id
+        """
+        pose = self._to_numpy(target_pose, dtype=np.float32)
+        if pose.ndim == 0 or pose.size == 0:
+            return None
+        if pose.ndim == 1:
+            return float(pose[0])
+        return pose[:, 0].astype(np.float32, copy=False)
+
+    def _infer_discriminator_input_dim(self) -> int:
+        """
+        计算判别器的输入维度。
+
+        当前约定:
+        - imitation observation: [base_height, joint_pos_rel(12), skill_id]
+        - 单时刻判别器帧: joint_pos_rel(12)
+        - 判别器真正使用 transition 输入: (x_{t-1}, x_t)
+        """
+        frame_dim = self._infer_discriminator_frame_dim()
+        return frame_dim * 2
+
+    def _infer_discriminator_frame_dim(self) -> int:
+        """
+        计算单时刻判别器帧的维度。
+        """
+        if int(self.env.imitation_obs_dim) < 13:
+            raise ValueError(
+                "当前 imitation_obs_dim 无法支持 joint_pos_rel 判别器输入；"
+                f"需要至少 13 维，实际得到 {self.env.imitation_obs_dim}"
+            )
+        return 12
+
+    def _compose_discriminator_frame_numpy_inputs(
+        self,
+        imitation_obs: Any,
+        command_onehot: Any,
+    ) -> np.ndarray:
+        """
+        构造 numpy 版单时刻判别器输入。
+
+        输入:
+        - `imitation_obs`: [B, 14] = [base_height, joint_pos_rel(12), skill_id]
+        - `command_onehot`: 为兼容旧调用链保留，这里不参与拼接
+
+        输出:
+        - [B, 12] = 归一化后的 joint_pos_rel(12)
+        """
+        imitation_array = self._ensure_batch_matrix(imitation_obs, self.env.imitation_obs_dim)
+        del command_onehot
+        joint_pos_rel = imitation_array[:, 1:13].astype(np.float32, copy=False)
+        return (joint_pos_rel / float(self._discriminator_joint_pos_scale)).astype(np.float32, copy=False)
+
+    def _compose_discriminator_transition_numpy_inputs(
+        self,
+        prev_imitation_obs: Any,
+        curr_imitation_obs: Any,
+        prev_command_onehot: Any,
+        curr_command_onehot: Any,
+    ) -> np.ndarray:
+        """
+        构造 numpy 版 transition 判别器输入。
+
+        输出维度:
+        - [B, 24] = [x_{t-1}(12), x_t(12)]
+        """
+        previous_frame = self._compose_discriminator_frame_numpy_inputs(
+            imitation_obs=prev_imitation_obs,
+            command_onehot=prev_command_onehot,
+        )
+        current_frame = self._compose_discriminator_frame_numpy_inputs(
+            imitation_obs=curr_imitation_obs,
+            command_onehot=curr_command_onehot,
+        )
+        return np.concatenate([previous_frame, current_frame], axis=-1).astype(np.float32, copy=False)
+
+    def _compose_discriminator_frame_torch_inputs(
+        self,
+        imitation_obs: torch.Tensor,
+        command_onehot: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        构造 torch 版单时刻判别器输入。
+
+        输出维度:
+        - [B, 12] = 归一化后的 joint_pos_rel(12)
+        """
+        if imitation_obs.ndim != 2:
+            raise ValueError(f"判别器 imitation_obs 期望二维张量 [B, D]，实际得到 shape={tuple(imitation_obs.shape)}")
+        if imitation_obs.shape[1] != self.env.imitation_obs_dim:
+            raise ValueError(
+                f"判别器 imitation_obs 特征维不匹配，期望 {self.env.imitation_obs_dim}，"
+                f"实际得到 {imitation_obs.shape[1]}"
+            )
+        del command_onehot
+        return imitation_obs[:, 1:13] / float(self._discriminator_joint_pos_scale)
+
+    def _compose_discriminator_transition_torch_inputs(
+        self,
+        prev_imitation_obs: torch.Tensor,
+        curr_imitation_obs: torch.Tensor,
+        prev_command_onehot: torch.Tensor,
+        curr_command_onehot: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        构造 torch 版 transition 判别器输入。
+
+        输出维度:
+        - [B, 24] = [x_{t-1}(12), x_t(12)]
+        """
+        previous_frame = self._compose_discriminator_frame_torch_inputs(
+            imitation_obs=prev_imitation_obs,
+            command_onehot=prev_command_onehot,
+        )
+        current_frame = self._compose_discriminator_frame_torch_inputs(
+            imitation_obs=curr_imitation_obs,
+            command_onehot=curr_command_onehot,
+        )
+        return torch.cat([previous_frame, current_frame], dim=-1)
+
+    def _collect_policy_transition_inputs_from_rollout(self) -> torch.Tensor | None:
+        """
+        从当前 rollout 中提取可用于 transition 判别器训练的 policy 样本。
+        """
+        episodes = self.rollout_buffer.extract_episodes()
+        transition_inputs: list[np.ndarray] = []
+        for episode in episodes:
+            if "imitation_obs" not in episode:
+                continue
+            if len(episode["imitation_obs"]) < 2:
+                continue
+
+            imitation_sequence = np.asarray(
+                [self._to_numpy(item, dtype=np.float32).reshape(-1) for item in episode["imitation_obs"]],
+                dtype=np.float32,
+            )
+            transition_inputs.append(
+                self._compose_discriminator_transition_numpy_inputs(
+                    prev_imitation_obs=imitation_sequence[:-1],
+                    curr_imitation_obs=imitation_sequence[1:],
+                    prev_command_onehot=None,
+                    curr_command_onehot=None,
+                )
+            )
+
+        if not transition_inputs:
+            return None
+
+        stacked = np.concatenate(transition_inputs, axis=0).astype(np.float32, copy=False)
+        return torch.as_tensor(stacked, dtype=torch.float32, device=self.device)
 
     def _ensure_batch_column(self, value: Any) -> np.ndarray:
         """

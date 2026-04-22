@@ -39,6 +39,7 @@ class IsaacLabPasistEnv(BasePasistEnv):
         num_envs: int = 1,
         skill_names: Sequence[str] | None = None,
         target_pose_bank: Sequence[np.ndarray] | dict[int, np.ndarray] | None = None,
+        skill_one_hot_map: dict[int, np.ndarray] | None = None,
         default_skill_id: int = 0,
         velocity_range: tuple[float, float] = (-0.5, 0.5),
         command_name: str = "base_velocity",
@@ -59,6 +60,10 @@ class IsaacLabPasistEnv(BasePasistEnv):
         - target_pose_bank:
           每个 skill 对应的 target pose。
           如果不传，则第一次 reset 后自动用当前 imitation observation 初始化。
+        - skill_one_hot_map:
+          skill_id 到 one-hot 编码的映射。
+          如果提供，则 actor 输入中的技能 command 和 `PasistCommand.one_hot`
+          都以这里为准；如果不提供，则回退到标准单位 one-hot。
         - default_skill_id:
           默认技能编号。
         - velocity_range:
@@ -68,11 +73,12 @@ class IsaacLabPasistEnv(BasePasistEnv):
         - policy_obs_key / critic_obs_key:
           Isaac Lab observation dict 中 actor / critic 观测的键名。
         - imitation_slices:
-          从 policy observation 中裁剪 imitation observation 的切片。
-          默认值针对当前最小 Go2 velocity 环境：
-          - [0:6]  -> base_ang_vel + projected_gravity
-          - [9:33] -> joint_pos_rel + joint_vel_rel
-          这样会跳过 velocity command 和 last_action。
+          旧版用于从 policy observation 中裁剪 imitation observation 的切片。
+          当前工程已经改成 pose-only imitation space：
+          - base_height (1)
+          - joint_pos_rel (12)
+          - skill_id (1)
+          因此这个参数保留兼容性，但当前默认实现不再直接使用它来构造 imitation observation。
         """
         self._register_builtin_tasks()
 
@@ -95,12 +101,20 @@ class IsaacLabPasistEnv(BasePasistEnv):
         if not 0 <= self._default_skill_id < len(self._skill_names):
             raise ValueError(f"default_skill_id 超出范围: {self._default_skill_id}")
 
-        # imitation_slices 是当前最小环境下最实用的一组默认切片：
-        # 0:6  -> base_ang_vel + projected_gravity
-        # 9:33 -> joint_pos_rel + joint_vel_rel
-        # 之所以跳过 6:9 和 33:45，是因为 velocity command / last_action
-        # 对 target pose 对齐和 DTW 的帮助较弱，反而更容易引入无关噪声。
+        self._skill_one_hot_map = self._normalize_skill_one_hot_map(skill_one_hot_map)
+        self._command_dim = self._infer_command_dim()
+        self._validate_skill_one_hot_coverage()
+
+        # 当前 pose-only imitation space 只真正依赖 joint_pos_rel；
+        # base_height 直接从 IsaacLab 机器人状态中读取；
+        # 最后一维保存当前 skill_id。
+        # 顺序约定为：
+        # - base_height (1)
+        # - joint_pos_rel (12)
+        # - skill_id (1)
+        # actor 输入则在原始 policy observation 的末尾额外拼接技能 one-hot command。
         self._imitation_slices = list(imitation_slices or ((0, 6), (9, 33)))
+        self._joint_pos_rel_slice = (9, 21)
 
         self._env_cfg = self._resolve_env_cfg(task_id=self._task_id, env_cfg=env_cfg, num_envs=num_envs)
         self._freeze_command_resampling(self._env_cfg)
@@ -109,7 +123,8 @@ class IsaacLabPasistEnv(BasePasistEnv):
 
         self._num_envs = int(self._unwrapped.num_envs)
         self._device = str(self._unwrapped.device)
-        self._obs_dim = self._infer_obs_dim()
+        self._base_obs_dim = self._infer_base_obs_dim()
+        self._obs_dim = self._base_obs_dim + self.command_dim
         self._action_dim = self._infer_action_dim()
         self._imitation_obs_dim = self._infer_imitation_obs_dim()
 
@@ -135,6 +150,11 @@ class IsaacLabPasistEnv(BasePasistEnv):
     def num_skills(self) -> int:
         """返回技能数量。"""
         return len(self._skill_names)
+
+    @property
+    def command_dim(self) -> int:
+        """返回技能 command 的 one-hot 维度。"""
+        return self._command_dim
 
     @property
     def velocity_range(self) -> tuple[float, float]:
@@ -181,9 +201,13 @@ class IsaacLabPasistEnv(BasePasistEnv):
         self._current_command = command
         self._apply_command_to_env(command)
 
-        policy_obs = self._extract_policy_observation(raw_obs)
+        raw_policy_obs = self._extract_policy_observation(raw_obs)
+        policy_obs = self._augment_policy_observation_with_command(raw_policy_obs, command)
         critic_obs = self._extract_critic_observation(raw_obs)
         measured_velocity = self._extract_measured_velocity(critic_obs)
+        base_height = self._extract_base_height()
+        base_pitch = self._extract_base_pitch()
+        imitation_obs = self.extract_imitation_observation(policy_obs)
 
         self._ensure_target_pose_initialized(command.skill_id, policy_obs)
         info = self.build_info(
@@ -194,6 +218,13 @@ class IsaacLabPasistEnv(BasePasistEnv):
                 "raw_obs": self._sanitize_to_host(raw_obs),
                 "raw_info": self._sanitize_to_host(raw_info),
                 "critic_obs": critic_obs.copy(),
+                "imitation_obs": imitation_obs.copy(),
+                "base_height": (
+                    float(base_height) if np.asarray(base_height).ndim == 0 else np.asarray(base_height, dtype=np.float32).copy()
+                ),
+                "base_pitch": (
+                    float(base_pitch) if np.asarray(base_pitch).ndim == 0 else np.asarray(base_pitch, dtype=np.float32).copy()
+                ),
                 "num_envs": self._num_envs,
                 "task_id": self._task_id,
             },
@@ -217,14 +248,17 @@ class IsaacLabPasistEnv(BasePasistEnv):
         if self._current_command is not None:
             self._apply_command_to_env(self._current_command)
 
-        policy_obs = self._extract_policy_observation(raw_obs)
+        active_command = self._current_command or self.sample_command(skill_id=self._default_skill_id)
+        raw_policy_obs = self._extract_policy_observation(raw_obs)
+        policy_obs = self._augment_policy_observation_with_command(raw_policy_obs, active_command)
         critic_obs = self._extract_critic_observation(raw_obs)
         reward = self._tensor_to_numpy(raw_reward)
         terminated = self._tensor_to_numpy(raw_terminated).astype(bool)
         truncated = self._tensor_to_numpy(raw_truncated).astype(bool)
         measured_velocity = self._extract_measured_velocity(critic_obs)
-
-        active_command = self._current_command or self.sample_command(skill_id=self._default_skill_id)
+        base_height = self._extract_base_height()
+        base_pitch = self._extract_base_pitch()
+        imitation_obs = self.extract_imitation_observation(policy_obs)
         info = self.build_info(
             observation=policy_obs,
             command=active_command,
@@ -233,6 +267,13 @@ class IsaacLabPasistEnv(BasePasistEnv):
                 "raw_obs": self._sanitize_to_host(raw_obs),
                 "raw_info": self._sanitize_to_host(raw_info),
                 "critic_obs": critic_obs.copy(),
+                "imitation_obs": imitation_obs.copy(),
+                "base_height": (
+                    float(base_height) if np.asarray(base_height).ndim == 0 else np.asarray(base_height, dtype=np.float32).copy()
+                ),
+                "base_pitch": (
+                    float(base_pitch) if np.asarray(base_pitch).ndim == 0 else np.asarray(base_pitch, dtype=np.float32).copy()
+                ),
                 "env_reward": reward.copy() if isinstance(reward, np.ndarray) else reward,
                 "terminated": terminated.copy() if isinstance(terminated, np.ndarray) else terminated,
                 "truncated": truncated.copy() if isinstance(truncated, np.ndarray) else truncated,
@@ -279,16 +320,41 @@ class IsaacLabPasistEnv(BasePasistEnv):
         """
         从完整 policy observation 中提取 imitation observation。
 
-        当前默认切片基于最小 Go2 velocity 环境：
-        - 0:6   -> base_ang_vel + projected_gravity
-        - 9:33  -> joint_pos_rel + joint_vel_rel
+        当前返回 pose-only imitation observation：
+        - base_height (1)
+        - joint_pos_rel (12)
+        - skill_id (1)
 
-        这套切片适合当前单技能 `walk` 的最小版本。
-        后面如果换成 crawl / bipedalize 等技能，可以改传入的 imitation_slices。
+        这更贴近当前项目对 keyframe / target pose 的定义：
+        target pose 不再包含速度；
+        其中最后一位不再保存 pitch，而是保存离散 skill_id，
+        方便后续模块直接通过 target pose 读取技能编号。
         """
-        obs = np.asarray(observation, dtype=np.float32)
-        segments = [obs[..., start:end] for start, end in self._imitation_slices]
-        return np.concatenate(segments, axis=-1).astype(np.float32, copy=False)
+        joint_pos_rel = self._extract_joint_pos_rel(observation)
+        base_height = self._extract_base_height()
+        current_skill_id = self._extract_current_skill_id()
+
+        if np.asarray(joint_pos_rel).ndim == 1:
+            imitation_obs = np.concatenate(
+                [
+                    np.asarray([base_height], dtype=np.float32).reshape(1),
+                    np.asarray(joint_pos_rel, dtype=np.float32).reshape(-1),
+                    np.asarray([current_skill_id], dtype=np.float32).reshape(1),
+                ],
+                axis=0,
+            )
+        else:
+            height_column = np.asarray(base_height, dtype=np.float32).reshape(-1, 1)
+            skill_id_column = np.asarray(current_skill_id, dtype=np.float32).reshape(-1, 1)
+            imitation_obs = np.concatenate(
+                [
+                    height_column,
+                    np.asarray(joint_pos_rel, dtype=np.float32),
+                    skill_id_column,
+                ],
+                axis=-1,
+            )
+        return imitation_obs.astype(np.float32, copy=False)
 
     def measure_velocity(self, observation: np.ndarray) -> float:
         """
@@ -373,8 +439,8 @@ class IsaacLabPasistEnv(BasePasistEnv):
         if hasattr(command_cfg, "debug_vis"):
             command_cfg.debug_vis = False
 
-    def _infer_obs_dim(self) -> int:
-        """从 observation_space 推断单环境的 policy observation 维度。"""
+    def _infer_base_obs_dim(self) -> int:
+        """从 observation_space 推断原始 policy observation 维度。"""
         obs_space = self._env.observation_space
         if hasattr(obs_space, "spaces"):
             policy_space = obs_space.spaces[self._policy_obs_key]
@@ -389,8 +455,55 @@ class IsaacLabPasistEnv(BasePasistEnv):
         return int(self._env.action_space.shape[-1])
 
     def _infer_imitation_obs_dim(self) -> int:
-        """根据 imitation_slices 计算 imitation observation 维度。"""
-        return int(sum(end - start for start, end in self._imitation_slices))
+        """当前 pose-only imitation observation 维度固定为 14。"""
+        return 14
+
+    def _normalize_skill_one_hot_map(
+        self,
+        skill_one_hot_map: dict[int, np.ndarray] | None,
+    ) -> dict[int, np.ndarray]:
+        """标准化 skill_id -> one-hot 映射。"""
+        if skill_one_hot_map is None:
+            return {}
+
+        normalized: dict[int, np.ndarray] = {}
+        dims: set[int] = set()
+        for skill_id, one_hot in skill_one_hot_map.items():
+            vector = np.asarray(one_hot, dtype=np.float32).reshape(-1)
+            if vector.size == 0:
+                raise ValueError(f"skill_id={skill_id} 的 one-hot 不能为空")
+            normalized[int(skill_id)] = vector.copy()
+            dims.add(int(vector.size))
+        if len(dims) > 1:
+            raise ValueError("skill_one_hot_map 中所有 one-hot 维度必须一致")
+        return normalized
+
+    def _infer_command_dim(self) -> int:
+        """推断技能 command 维度。"""
+        if self._skill_one_hot_map:
+            first_vector = next(iter(self._skill_one_hot_map.values()))
+            return int(first_vector.shape[0])
+        return int(self.num_skills)
+
+    def _validate_skill_one_hot_coverage(self) -> None:
+        """确认当前启用的技能在 one-hot 配置中都有定义。"""
+        if not self._skill_one_hot_map:
+            return
+        for skill_id in range(self.num_skills):
+            if skill_id not in self._skill_one_hot_map:
+                raise KeyError(
+                    f"skill_one_hot_map 中缺少 skill_id={skill_id} 的编码；"
+                    f"当前启用的技能为 {self._skill_names}"
+                )
+
+    def get_skill_one_hot(self, skill_id: int) -> np.ndarray:
+        """返回指定技能对应的 one-hot 编码。"""
+        skill_id = int(skill_id)
+        if self._skill_one_hot_map:
+            if skill_id not in self._skill_one_hot_map:
+                raise KeyError(f"skill_id={skill_id} 没有在 skill_one_hot_map 中定义")
+            return self._skill_one_hot_map[skill_id].copy()
+        return super().get_skill_one_hot(skill_id)
 
     def _normalize_target_pose_bank(
         self,
@@ -414,6 +527,17 @@ class IsaacLabPasistEnv(BasePasistEnv):
 
         for skill_id, target_pose in items:
             pose = np.asarray(target_pose, dtype=np.float32).reshape(-1)
+            if pose.shape[0] != self._imitation_obs_dim:
+                raise ValueError(
+                    f"target_pose_bank 中 skill_id={skill_id} 的维度不正确："
+                    f"期望 {self._imitation_obs_dim}，实际得到 {pose.shape[0]}。"
+                    "当前工程的 target pose 约定为 [base_height, joint_pos_rel(12), skill_id] 共 14 维。"
+                )
+            encoded_skill_id = int(round(float(pose[-1])))
+            if encoded_skill_id != int(skill_id):
+                raise ValueError(
+                    f"target_pose_bank 中 skill_id={skill_id} 的最后一维编码为 {encoded_skill_id}，两者不一致。"
+                )
             normalized[int(skill_id)] = pose.copy()
         return normalized
 
@@ -437,12 +561,36 @@ class IsaacLabPasistEnv(BasePasistEnv):
         self._target_pose_bank[skill_id] = np.asarray(pose, dtype=np.float32).reshape(-1).copy()
 
     def _extract_policy_observation(self, raw_obs: Any) -> np.ndarray:
-        """从 Isaac Lab 的 observation 返回值中提取 policy observation。"""
+        """从 Isaac Lab 的 observation 返回值中提取原始 policy observation。"""
         if isinstance(raw_obs, dict):
             policy_obs = raw_obs[self._policy_obs_key]
         else:
             policy_obs = raw_obs
         return self._tensor_to_numpy(policy_obs).astype(np.float32, copy=False)
+
+    def _augment_policy_observation_with_command(
+        self,
+        policy_obs: np.ndarray,
+        command: PasistCommand,
+    ) -> np.ndarray:
+        """
+        在原始 policy observation 末尾拼接技能 one-hot command。
+
+        这样 actor 输入会从原来的 45 维扩展为 49 维，
+        且 skill command 的真来源统一为环境侧的 `PasistCommand.one_hot`。
+        """
+        obs = np.asarray(policy_obs, dtype=np.float32)
+        command_one_hot = np.asarray(command.one_hot, dtype=np.float32).reshape(-1)
+        if command_one_hot.shape[0] != self.command_dim:
+            raise ValueError(
+                f"command one-hot 维度不正确：期望 {self.command_dim}，实际得到 {command_one_hot.shape[0]}"
+            )
+
+        if obs.ndim == 1:
+            return np.concatenate([obs, command_one_hot], axis=0).astype(np.float32, copy=False)
+
+        command_batch = np.broadcast_to(command_one_hot.reshape(1, -1), (obs.shape[0], command_one_hot.shape[0]))
+        return np.concatenate([obs, command_batch.astype(np.float32, copy=False)], axis=-1).astype(np.float32, copy=False)
 
     def _extract_critic_observation(self, raw_obs: Any) -> np.ndarray:
         """从 Isaac Lab observation 中提取 critic observation；如果没有则回退到 policy。"""
@@ -465,6 +613,60 @@ class IsaacLabPasistEnv(BasePasistEnv):
             return obs[:, 0].astype(np.float32, copy=False)
         flattened = obs.reshape(-1, obs.shape[-1])
         return flattened[:, 0].astype(np.float32, copy=False)
+
+    def _extract_joint_pos_rel(self, policy_obs: np.ndarray) -> np.ndarray:
+        """
+        从 policy observation 中提取 joint_pos_rel。
+
+        当前 Go2 最小环境的 policy observation 结构中：
+        - [9:21] -> joint_pos_rel
+        """
+        obs = np.asarray(policy_obs, dtype=np.float32)
+        start, end = self._joint_pos_rel_slice
+        if obs.shape[-1] < end:
+            raise ValueError(f"policy observation 维度不足，无法提取 joint_pos_rel；需要至少 {end} 维")
+        return obs[..., start:end].astype(np.float32, copy=False)
+
+    def _extract_base_height(self) -> float | np.ndarray:
+        """
+        直接从 IsaacLab 机器人状态读取 base height。
+
+        这里读取的是 `robot.data.root_pos_w[:, 2]`，也就是世界坐标系下的根部高度。
+        """
+        robot = self._unwrapped.scene["robot"]
+        base_height = self._tensor_to_numpy(robot.data.root_pos_w[:, 2]).astype(np.float32, copy=False)
+        if self._num_envs == 1 and base_height.shape[0] == 1:
+            return float(base_height[0])
+        return base_height
+
+    def _extract_base_pitch(self) -> float | np.ndarray:
+        """
+        直接从 IsaacLab 机器人状态读取 base pitch。
+
+        这里通过根部四元数 `root_quat_w` 转换到 Euler XYZ，取中间的 pitch 分量。
+        """
+        import isaaclab.utils.math as math_utils
+
+        robot = self._unwrapped.scene["robot"]
+        root_quat_w = robot.data.root_quat_w
+        _, pitch, _ = math_utils.euler_xyz_from_quat(root_quat_w)
+        pitch_array = self._tensor_to_numpy(pitch).astype(np.float32, copy=False)
+        if self._num_envs == 1 and pitch_array.shape[0] == 1:
+            return float(pitch_array[0])
+        return pitch_array
+
+    def _extract_current_skill_id(self) -> float | np.ndarray:
+        """
+        返回当前 command 对应的 skill_id，并转成可拼接到 imitation observation 的浮点表示。
+
+        当前训练流程里所有并行环境共享同一个 skill command，
+        因此这里会广播成 `[num_envs]`。
+        """
+        active_command = self._current_command
+        skill_id = float(self._default_skill_id if active_command is None else active_command.skill_id)
+        if self._num_envs == 1:
+            return skill_id
+        return np.full((self._num_envs,), skill_id, dtype=np.float32)
 
     def _split_reset_result(self, reset_result: Any) -> tuple[Any, dict[str, Any]]:
         """兼容 `env.reset()` 可能返回 `obs` 或 `(obs, info)` 两种形式。"""

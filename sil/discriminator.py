@@ -105,7 +105,9 @@ class SILDiscriminator(nn.Module):
     PASIST / GASIL 中的自模仿判别器。
 
     判别器输入:
-    - imitation observation，通常是从观测中裁出的模仿子空间
+    - transition imitation observation，由连续两帧关节角拼接而成：
+      1. `x_{t-1}` = `joint_pos_rel(12)`
+      2. `x_t` = `joint_pos_rel(12)`
     - shape 常见为 `[batch_size, input_dim]`
 
     判别器输出:
@@ -116,12 +118,14 @@ class SILDiscriminator(nn.Module):
     - 复用 [rl/actor_critic_new.py](/media/ubuntu20/D/robotic/复现/复现/rl/actor_critic_new.py) 中的 `MLP`
     - 支持从 YAML 配置文件初始化
     - 支持根据 YAML 自动构建优化器
+    - 当前判别器只关注连续两帧关节角变化，便于更快收敛
     """
 
     def __init__(
         self,
         input_dim: int,
         hidden_dims: int | Sequence[int] | None = (256, 256),
+        hidden_activation: str = "relu",
         gradient_penalty_weight: float = 10.0,
         expert_target: float = 1.0,
         policy_target: float = -1.0,
@@ -145,6 +149,7 @@ class SILDiscriminator(nn.Module):
         super().__init__()
         self.input_dim = int(input_dim)
         self.hidden_dims = _to_hidden_dims(hidden_dims)
+        self.hidden_activation = str(hidden_activation)
         self.gradient_penalty_weight = float(gradient_penalty_weight)
         self.expert_target = float(expert_target)
         self.policy_target = float(policy_target)
@@ -155,6 +160,7 @@ class SILDiscriminator(nn.Module):
             hidden_dims=self.hidden_dims,
             output_dim=1,
             output_activation=None,
+            hidden_activation=self.hidden_activation,
         )
 
     @classmethod
@@ -172,6 +178,7 @@ class SILDiscriminator(nn.Module):
         ```yaml
         model:
           hidden_layers: [512, 256]
+          activation: elu
         loss:
           gradient_penalty_weight: 10.0
           expert_target: 1.0
@@ -184,10 +191,12 @@ class SILDiscriminator(nn.Module):
         model_cfg = dict(config.get("model", {}))
         loss_cfg = dict(config.get("loss", {}))
         hidden_dims = model_cfg.get("hidden_layers", model_cfg.get("hidden_dims", [256, 256]))
+        hidden_activation = model_cfg.get("activation", model_cfg.get("hidden_activation", "relu"))
 
         return cls(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
+            hidden_activation=hidden_activation,
             gradient_penalty_weight=loss_cfg.get("gradient_penalty_weight", 10.0),
             expert_target=loss_cfg.get("expert_target", 1.0),
             policy_target=loss_cfg.get("policy_target", -1.0),

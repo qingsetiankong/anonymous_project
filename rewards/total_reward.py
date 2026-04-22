@@ -37,14 +37,13 @@ def compute_task_weight(task_reward: float | np.ndarray, sigma_t: float) -> floa
 
     按 PASIST 原文 Eq. (8) 实现：
 
-    omega_T = exp(-(r_T - sigma_T))
+    omega_T = exp(-|r_T - sigma_T|)
 
-    重要说明:
-    - 这里不再做之前那个“更稳健的工程裁剪近似”
-    - 因为我们这里的目标是尽量与原文一致
-    - 按这个公式，当 `task_reward < sigma_t` 时，`omega_T` 可能大于 1，
-      从而使 `(1 - omega_T)` 为负；这在工程上不一定最稳，
-      但它更接近当前论文给出的写法
+    说明:
+    - 原文这里写的是范数形式 `||r_T - sigma_T||`
+    - 对当前标量 `r_T` 实现来说，等价为绝对值 `abs(r_T - sigma_T)`
+    - 因此 `omega_T` 的取值稳定落在 `(0, 1]`，不会再因为
+      `r_T < sigma_t` 而指数爆炸到大于 1 的区间
 
     输入:
     - `task_reward`:
@@ -57,7 +56,7 @@ def compute_task_weight(task_reward: float | np.ndarray, sigma_t: float) -> floa
     - batched 时返回 shape = [B] 的 `np.ndarray`
     """
     task_reward_array = _as_float_array(task_reward)
-    omega_t = np.exp(-(task_reward_array - float(sigma_t)), dtype=np.float32)
+    omega_t = np.exp(-np.abs(task_reward_array - float(sigma_t)), dtype=np.float32)
     return _maybe_scalar(omega_t)
 
 

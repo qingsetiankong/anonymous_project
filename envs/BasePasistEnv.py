@@ -21,6 +21,7 @@ class PasistCommand:
       技能的可读名称，方便日志记录和调试。
     - one_hot:
       技能编号对应的 one-hot 向量，对应论文中的离散 motion command m。
+      当前推荐由统一的 skill one-hot 配置解析得到，而不是在多个模块里各自手写。
 
     这个结构的作用是把“速度命令 + 技能命令”打包在一起，
     让环境、trainer、skill selector 之间的接口统一。
@@ -116,6 +117,17 @@ class BasePasistEnv(ABC):
         子类可以覆盖这个属性。
         """
         return self.num_skills
+
+    def get_skill_one_hot(self, skill_id: int) -> np.ndarray:
+        """
+        返回指定 skill_id 对应的 one-hot 编码。
+
+        基类默认返回长度为 `command_dim` 的标准 one-hot。
+        如果具体环境希望从配置文件中读取更明确的编码定义，可以覆盖这个方法。
+        """
+        one_hot = np.zeros(self.command_dim, dtype=np.float32)
+        one_hot[int(skill_id)] = 1.0
+        return one_hot
 
     @property
     def velocity_range(self) -> tuple[float, float]:
@@ -258,8 +270,7 @@ class BasePasistEnv(ABC):
 
         low, high = self.velocity_range
         velocity = float(np.clip(float(velocity), low, high))
-        one_hot = np.zeros(self.command_dim, dtype=np.float32)
-        one_hot[skill_id] = 1.0
+        one_hot = self.get_skill_one_hot(skill_id)
         return PasistCommand(
             velocity=velocity,
             skill_id=skill_id,
