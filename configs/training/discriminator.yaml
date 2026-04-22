@@ -9,13 +9,13 @@ optimizer:
   # PyTorch 优化器类名，例如 Adam / AdamW / SGD。
   name: Adam
   # 学习率。
-  lr: 0.0001
+  lr: 0.0005
   # 可选；如果不需要可以保留 0。
   weight_decay: 0.0
 
 loss:
   # expert 样本梯度惩罚权重。
-  gradient_penalty_weight: 0.0 
+  gradient_penalty_weight: 0.5 
   # expert / SIL buffer 样本希望逼近的分数。
   expert_target: 1.0
   # 当前 policy 样本希望逼近的分数。
@@ -25,7 +25,7 @@ trajectory_selector:
   # 轨迹进入 SIL buffer 之前的最低累计 task reward。
   # 结合 20260422-163035 这次 run 的日志，早期明显较差的轨迹 task return
   # 大多低于 50，而后期较稳定阶段通常高于这一水平，因此这里先用 50 作为保守门槛。
-  min_task_return: 50.0
+  min_task_return: 30.0
   # 轨迹进入 SIL buffer 之前允许的最大 DTW 距离。
   # 结合当前日志，早期 buffer DTW 约在 0.63~0.65，后期较好轨迹约在 0.56~0.60，
   # 因此这里先用 0.62 挡掉最开始那批明显偏离目标的轨迹。
