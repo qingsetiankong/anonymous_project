@@ -44,4 +44,15 @@ reward_weights:
   total:
     sigma_t: 0.5
     sigma_sil: 0.6
+    # 只有当 D 明显大于这个正阈值时，SIL reward 才开始生效。
+    sil_reward_positive_margin: 0.1
+    # 当 buffer 的 mean_dtw 高于 sigma_sil 后，按这个速率指数降权。
+    sil_weight_dtw_decay_rate: 10.0
+    # 判别器 expert-policy score margin 的线性门控区间。
+    sil_weight_confidence_min_margin: 0.2
+    sil_weight_confidence_max_margin: 0.6
+    # buffer 刚达到可训练阈值后，再用多少条新增 expert 做 SIL warmup。
+    sil_weight_warmup_trajectories: 20
+    # 最终 SIL 全局权重上限，避免一开始过强。
+    sil_weight_cap: 0.4
     omega_r: 1.0

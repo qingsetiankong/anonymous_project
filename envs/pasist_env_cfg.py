@@ -22,6 +22,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
+from go2_joint_order import GO2_JOINT_ORDER
 from unitree_rl_lab.assets.robots.unitree import UNITREE_GO2_CFG as ROBOT_CFG
 from unitree_rl_lab.tasks.locomotion import mdp
 
@@ -56,25 +57,6 @@ PASIST 专用 Isaac Lab 环境配置。
 TASK_ID = "PASIST-Go2-Base"
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 INIT_POSE_PATH = PROJECT_ROOT / "init_pose" / "init_pose.npy"
-
-# 这里的顺序必须与 Go2 的 12 个关节顺序保持一致。
-# 按照 unitree_rl_lab 中 `UNITREE_GO2_CFG.joint_sdk_names` 的定义，顺序为：
-# FR -> FL -> RR -> RL，每条腿依次是 hip / thigh / calf。
-GO2_JOINT_ORDER = (
-    "FR_hip_joint",
-    "FR_thigh_joint",
-    "FR_calf_joint",
-    "FL_hip_joint",
-    "FL_thigh_joint",
-    "FL_calf_joint",
-    "RR_hip_joint",
-    "RR_thigh_joint",
-    "RR_calf_joint",
-    "RL_hip_joint",
-    "RL_thigh_joint",
-    "RL_calf_joint",
-)
-
 
 def _load_init_joint_positions(init_pose_path: pathlib.Path = INIT_POSE_PATH) -> dict[str, float]:
     """

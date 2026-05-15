@@ -66,11 +66,15 @@ class DeployConfig:
     onnx_model_path: pathlib.Path | None
     onnx_input_name: str
     onnx_output_name: str
+    onnx_startup_pose_source: str
+    command_skill_id: int
+    command_one_hot: np.ndarray
     fixed_velocity_command: np.ndarray
     observation_order: tuple[str, ...]
     observation_scales: dict[str, np.ndarray]
     observation_clip_low: dict[str, np.ndarray]
     observation_clip_high: dict[str, np.ndarray]
+    policy_obs_dim: int
 
 
 def _parse_fixed_command_value(value: object) -> float:
@@ -107,6 +111,92 @@ def _parse_clip_vector(clip_cfg: object, dim: int) -> tuple[np.ndarray, np.ndarr
         return clip_array[:, 0].astype(np.float32), clip_array[:, 1].astype(np.float32)
 
     raise ValueError(f"Unsupported clip specification for dim={dim}: {clip_cfg}")
+
+
+def quat_wxyz_to_rotation_matrix(quaternion_wxyz: np.ndarray) -> np.ndarray:
+    """把 wxyz 四元数转换为 body->world 旋转矩阵。"""
+    quat = np.asarray(quaternion_wxyz, dtype=np.float32).reshape(4)
+    norm = float(np.linalg.norm(quat))
+    if norm < 1.0e-8:
+        return np.eye(3, dtype=np.float32)
+    quat = quat / norm
+    w, x, y, z = quat
+    return np.asarray(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def compute_projected_gravity(quaternion_wxyz: np.ndarray) -> np.ndarray:
+    """
+    把世界系重力 `[0, 0, -1]` 投影到机体系。
+
+    对应训练时的 `projected_gravity` 观测项。
+    """
+    rotation_body_to_world = quat_wxyz_to_rotation_matrix(quaternion_wxyz)
+    gravity_world = np.asarray([0.0, 0.0, -1.0], dtype=np.float32)
+    return rotation_body_to_world.T @ gravity_world
+
+
+def apply_observation_postprocess(
+    cfg: DeployConfig,
+    term_name: str,
+    raw_value: np.ndarray,
+) -> np.ndarray:
+    """按 deploy.yaml 中 observations.* 的 clip / scale 处理单个观测项。"""
+    value = np.asarray(raw_value, dtype=np.float32).reshape(-1)
+    clip_low = cfg.observation_clip_low[term_name]
+    clip_high = cfg.observation_clip_high[term_name]
+    scale = cfg.observation_scales[term_name]
+    value = np.clip(value, clip_low, clip_high)
+    return value * scale
+
+
+def infer_policy_observation_dim(cfg: DeployConfig) -> int:
+    return int(sum(scale.size for scale in cfg.observation_scales.values()) + cfg.command_one_hot.size)
+
+
+def build_policy_observation_from_state(
+    cfg: DeployConfig,
+    joint_pos_policy: np.ndarray,
+    joint_vel_policy: np.ndarray,
+    imu_quaternion_wxyz: np.ndarray,
+    imu_gyro: np.ndarray,
+    last_action: np.ndarray,
+) -> np.ndarray:
+    """
+    从部署侧可观测状态重建训练时 policy 使用的观测。
+
+    当前约定：
+    - 先拼出 45 维连续观测项
+    - 再在末尾追加 skill one-hot，形成最终 49 维 policy obs
+    """
+    observation_terms_raw = {
+        "base_ang_vel": np.asarray(imu_gyro, dtype=np.float32).reshape(-1),
+        "projected_gravity": compute_projected_gravity(imu_quaternion_wxyz),
+        "velocity_commands": np.asarray(cfg.fixed_velocity_command, dtype=np.float32).reshape(-1),
+        "joint_pos_rel": np.asarray(joint_pos_policy, dtype=np.float32).reshape(-1) - cfg.action_offset,
+        "joint_vel_rel": np.asarray(joint_vel_policy, dtype=np.float32).reshape(-1),
+        "last_action": np.asarray(last_action, dtype=np.float32).reshape(-1),
+    }
+
+    observation_parts: list[np.ndarray] = []
+    for term_name in cfg.observation_order:
+        if term_name not in observation_terms_raw:
+            raise KeyError(
+                f"Unsupported observation term in deploy.yaml: '{term_name}'. "
+                "Please extend deploy/go2_controller.py to rebuild this term."
+            )
+        observation_parts.append(
+            apply_observation_postprocess(cfg, term_name, observation_terms_raw[term_name])
+        )
+    if cfg.command_one_hot.size > 0:
+        observation_parts.append(cfg.command_one_hot.astype(np.float32, copy=False))
+    return np.concatenate(observation_parts, axis=0).astype(np.float32, copy=False)
 
 
 def load_deploy_config(config_path: pathlib.Path) -> DeployConfig:
@@ -188,6 +278,16 @@ def load_deploy_config(config_path: pathlib.Path) -> DeployConfig:
 
     onnx_input_name = str(controller_cfg.get("onnx_input_name", "observations"))
     onnx_output_name = str(controller_cfg.get("onnx_output_name", "actions"))
+    onnx_startup_pose_source = str(controller_cfg.get("onnx_startup_pose_source", "direct")).strip().lower()
+    if onnx_startup_pose_source not in {"direct", "action_offset", "target_joint_pos", "default_joint_pos"}:
+        raise ValueError(
+            "controller.onnx_startup_pose_source must be one of "
+            "{'direct', 'action_offset', 'target_joint_pos', 'default_joint_pos'}. "
+            f"Got '{onnx_startup_pose_source}'."
+        )
+    policy_command_cfg = cfg.get("policy_command", {}) or {}
+    command_skill_id = int(policy_command_cfg.get("skill_id", 0))
+    command_one_hot = np.asarray(policy_command_cfg.get("one_hot", []), dtype=np.float32).reshape(-1)
 
     command_cfg = cfg.get("commands", {}).get("base_velocity", {}).get("ranges", {})
     fixed_velocity_command = np.asarray(
@@ -227,6 +327,13 @@ def load_deploy_config(config_path: pathlib.Path) -> DeployConfig:
         observation_clip_low[term_name] = term_clip_low
         observation_clip_high[term_name] = term_clip_high
 
+    policy_obs_dim = int(sum(scale.size for scale in observation_scales.values()) + command_one_hot.size)
+    if controller_mode == "onnx_policy" and command_one_hot.size == 0:
+        raise ValueError(
+            "controller.mode='onnx_policy' requires deploy.yaml policy_command.one_hot, "
+            "because the trained policy observation appends skill one-hot at the end."
+        )
+
     return DeployConfig(
         pose_reference_order=pose_reference_order,
         joint_ids_map=joint_ids_map,
@@ -242,11 +349,15 @@ def load_deploy_config(config_path: pathlib.Path) -> DeployConfig:
         onnx_model_path=onnx_model_path,
         onnx_input_name=onnx_input_name,
         onnx_output_name=onnx_output_name,
+        onnx_startup_pose_source=onnx_startup_pose_source,
+        command_skill_id=command_skill_id,
+        command_one_hot=command_one_hot,
         fixed_velocity_command=fixed_velocity_command,
         observation_order=tuple(observation_order),
         observation_scales=observation_scales,
         observation_clip_low=observation_clip_low,
         observation_clip_high=observation_clip_high,
+        policy_obs_dim=policy_obs_dim,
     )
 
 
@@ -385,6 +496,8 @@ class Go2Controller:
         self.phase = ControlPhase.BOOT_TO_DEFAULT
         self.commanded_pose_policy: np.ndarray | None = None
         self._last_policy_action = np.zeros_like(self.cfg.default_joint_pos, dtype=np.float32)
+        self._follow_target_pose_policy: np.ndarray | None = None
+        self._enter_policy_after_target = False
         self._onnx_session = None
         self._onnx_input_name = self.cfg.onnx_input_name
         self._onnx_output_name = self.cfg.onnx_output_name
@@ -522,6 +635,16 @@ class Go2Controller:
         if self._onnx_output_name not in available_outputs and available_outputs:
             self._onnx_output_name = available_outputs[0]
 
+        input_shape = self._onnx_session.get_inputs()[0].shape
+        if input_shape and isinstance(input_shape[-1], int):
+            model_obs_dim = int(input_shape[-1])
+            if model_obs_dim != int(self.cfg.policy_obs_dim):
+                raise ValueError(
+                    "ONNX input dim 与 deploy 重建的 policy obs dim 不一致："
+                    f" model={model_obs_dim}, deploy={self.cfg.policy_obs_dim}."
+                    " 请检查 deploy.yaml 的 observations.* 和 policy_command.one_hot 是否与训练时一致。"
+                )
+
     def _sdk_to_policy_order(self, sdk_values: np.ndarray) -> np.ndarray:
         return np.asarray(sdk_values, dtype=np.float32)[self.cfg.joint_ids_map]
 
@@ -565,67 +688,27 @@ class Go2Controller:
 
     @staticmethod
     def _quat_wxyz_to_rotation_matrix(quaternion_wxyz: np.ndarray) -> np.ndarray:
-        """把 wxyz 四元数转换为 body->world 旋转矩阵。"""
-        quat = np.asarray(quaternion_wxyz, dtype=np.float32).reshape(4)
-        norm = float(np.linalg.norm(quat))
-        if norm < 1.0e-8:
-            return np.eye(3, dtype=np.float32)
-        quat = quat / norm
-        w, x, y, z = quat
-        return np.asarray(
-            [
-                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-            ],
-            dtype=np.float32,
-        )
+        return quat_wxyz_to_rotation_matrix(quaternion_wxyz)
 
     def _compute_projected_gravity(self, quaternion_wxyz: np.ndarray) -> np.ndarray:
-        """
-        把世界系重力 `[0, 0, -1]` 投影到机体系。
-
-        对应训练时的 `projected_gravity` 观测项。
-        """
-        rotation_body_to_world = self._quat_wxyz_to_rotation_matrix(quaternion_wxyz)
-        gravity_world = np.asarray([0.0, 0.0, -1.0], dtype=np.float32)
-        return rotation_body_to_world.T @ gravity_world
+        return compute_projected_gravity(quaternion_wxyz)
 
     def _apply_observation_postprocess(self, term_name: str, raw_value: np.ndarray) -> np.ndarray:
-        """按 deploy.yaml 中 observations.* 的 clip / scale 处理单个观测项。"""
-        value = np.asarray(raw_value, dtype=np.float32).reshape(-1)
-        clip_low = self.cfg.observation_clip_low[term_name]
-        clip_high = self.cfg.observation_clip_high[term_name]
-        scale = self.cfg.observation_scales[term_name]
-        value = np.clip(value, clip_low, clip_high)
-        return value * scale
+        return apply_observation_postprocess(self.cfg, term_name, raw_value)
 
     def _build_policy_observation(self) -> np.ndarray:
-        """从实时 lowstate 重建训练时 policy 使用的 45 维观测。"""
+        """从实时 lowstate 重建训练时 policy 使用的 49 维观测。"""
         joint_pos_policy = self._get_joint_pos_policy()
         joint_vel_policy = self._get_joint_vel_policy()
         imu_quaternion, imu_gyro = self._get_imu_state()
-
-        observation_terms_raw = {
-            "base_ang_vel": imu_gyro,
-            "projected_gravity": self._compute_projected_gravity(imu_quaternion),
-            "velocity_commands": self.cfg.fixed_velocity_command,
-            "joint_pos_rel": joint_pos_policy - self.cfg.action_offset,
-            "joint_vel_rel": joint_vel_policy,
-            "last_action": self._last_policy_action,
-        }
-
-        observation_parts: list[np.ndarray] = []
-        for term_name in self.cfg.observation_order:
-            if term_name not in observation_terms_raw:
-                raise KeyError(
-                    f"Unsupported observation term in deploy.yaml: '{term_name}'. "
-                    "Please extend go2_controller.py to rebuild this term."
-                )
-            observation_parts.append(
-                self._apply_observation_postprocess(term_name, observation_terms_raw[term_name])
-            )
-        return np.concatenate(observation_parts, axis=0).astype(np.float32)
+        return build_policy_observation_from_state(
+            cfg=self.cfg,
+            joint_pos_policy=joint_pos_policy,
+            joint_vel_policy=joint_vel_policy,
+            imu_quaternion_wxyz=imu_quaternion,
+            imu_gyro=imu_gyro,
+            last_action=self._last_policy_action,
+        )
 
     def _action_to_target_pose(self, action_policy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -669,9 +752,49 @@ class Go2Controller:
             return self.cfg.default_joint_pos
         if self.phase == ControlPhase.POLICY_CONTROL and self.commanded_pose_policy is not None:
             return self.commanded_pose_policy
+        if self.phase in (ControlPhase.MOVE_TO_TARGET, ControlPhase.HOLD_TARGET):
+            if self._follow_target_pose_policy is not None:
+                return self._follow_target_pose_policy
         if self.phase == ControlPhase.HOLD_TARGET and self.commanded_pose_policy is not None:
             return self.commanded_pose_policy
         return self.cfg.target_joint_pos
+
+    def _resolve_onnx_startup_pose_policy(self) -> np.ndarray | None:
+        source = self.cfg.onnx_startup_pose_source
+        if source == "direct":
+            return None
+        if source == "action_offset":
+            return self.cfg.action_offset.copy()
+        if source == "target_joint_pos":
+            return self.cfg.target_joint_pos.copy()
+        if source == "default_joint_pos":
+            return self.cfg.default_joint_pos.copy()
+        raise ValueError(f"Unsupported onnx_startup_pose_source: {source}")
+
+    def _begin_follow_sequence(self) -> None:
+        self._last_policy_action[:] = 0.0
+        if self.controller_mode != "onnx_policy":
+            self._follow_target_pose_policy = self.cfg.target_joint_pos.copy()
+            self._enter_policy_after_target = False
+            self.phase = ControlPhase.MOVE_TO_TARGET
+            print("[INFO] Start-follow button pressed. Moving toward target_joint_pos.")
+            return
+
+        startup_pose_policy = self._resolve_onnx_startup_pose_policy()
+        if startup_pose_policy is None:
+            self._follow_target_pose_policy = None
+            self._enter_policy_after_target = False
+            self.phase = ControlPhase.POLICY_CONTROL
+            print("[INFO] Start-follow button pressed. Switching to ONNX policy control.")
+            return
+
+        self._follow_target_pose_policy = startup_pose_policy
+        self._enter_policy_after_target = True
+        self.phase = ControlPhase.MOVE_TO_TARGET
+        print(
+            "[INFO] Start-follow button pressed. "
+            f"Moving toward ONNX startup pose source='{self.cfg.onnx_startup_pose_source}' before policy control."
+        )
 
     def _step_command_towards_goal(self, goal_policy: np.ndarray) -> np.ndarray:
         if self.commanded_pose_policy is None:
@@ -737,6 +860,16 @@ class Go2Controller:
 
         if self.phase == ControlPhase.MOVE_TO_TARGET:
             if measured_error <= self.reach_tolerance and command_error <= self.reach_tolerance:
+                if self._enter_policy_after_target:
+                    self.phase = ControlPhase.POLICY_CONTROL
+                    self.commanded_pose_policy = current_pose_policy.copy()
+                    self._enter_policy_after_target = False
+                    print(
+                        "[INFO] Reached ONNX startup pose tolerance. "
+                        "Switching to ONNX policy control."
+                    )
+                    return
+
                 self.phase = ControlPhase.HOLD_TARGET
                 if self.latch_reached_pose_on_target:
                     # Lock to the pose that was actually reached, which is usually more
@@ -758,6 +891,8 @@ class Go2Controller:
             if measured_error <= self.reach_tolerance and command_error <= self.reach_tolerance:
                 self.phase = ControlPhase.WAIT_FOR_START
                 self.commanded_pose_policy = self.cfg.default_joint_pos.copy()
+                self._follow_target_pose_policy = None
+                self._enter_policy_after_target = False
                 print(
                     "[INFO] Reset complete. Holding default_joint_pos. "
                     f"Press {self.start_follow_button} to start the next follow cycle."
@@ -790,6 +925,7 @@ class Go2Controller:
         )
         if self.controller_mode == "onnx_policy":
             print(f"[INFO] onnx_model_path={self.cfg.onnx_model_path}")
+            print(f"[INFO] onnx_startup_pose_source={self.cfg.onnx_startup_pose_source}")
             print(
                 f"[INFO] onnx_io_names=input:{self._onnx_input_name}, "
                 f"output:{self._onnx_output_name}"
@@ -850,13 +986,7 @@ class Go2Controller:
                 )
             elif self._consume_button_edge(self.start_follow_button):
                 if self.phase == ControlPhase.WAIT_FOR_START:
-                    self._last_policy_action[:] = 0.0
-                    if self.controller_mode == "onnx_policy":
-                        self.phase = ControlPhase.POLICY_CONTROL
-                        print("[INFO] Start-follow button pressed. Switching to ONNX policy control.")
-                    else:
-                        self.phase = ControlPhase.MOVE_TO_TARGET
-                        print("[INFO] Start-follow button pressed. Moving toward target_joint_pos.")
+                    self._begin_follow_sequence()
             elif self._consume_button_edge(self.reset_button):
                 if self.phase in (
                     ControlPhase.MOVE_TO_TARGET,
@@ -865,6 +995,8 @@ class Go2Controller:
                 ):
                     self.phase = ControlPhase.RETURN_TO_DEFAULT
                     self._last_policy_action[:] = 0.0
+                    self._follow_target_pose_policy = None
+                    self._enter_policy_after_target = False
                     print("[INFO] Cycle reset button pressed. Returning to default_joint_pos.")
 
             goal_policy = self._goal_for_phase()

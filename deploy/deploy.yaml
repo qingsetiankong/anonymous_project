@@ -19,10 +19,15 @@ controller:
   onnx_model_path: ../result/policy.onnx
   onnx_input_name: observations
   onnx_output_name: actions
+  onnx_startup_pose_source: action_offset
+policy_command:
+  skill_id: 0
+  one_hot: [1.0, 0.0, 0.0, 0.0]
 commands:
   base_velocity:
     ranges:
-      lin_vel_x: [1.0, 1.0]
+      # 训练环境 IsaacGymPasistEnv 当前会把速度命令裁到 [-0.5, 0.5]。
+      lin_vel_x: [0.5, 0.5]
       lin_vel_y: [0, 0]
       ang_vel_z: [0, 0]
       heading: null
@@ -43,8 +48,8 @@ actions:
     - [-100.0, 100.0]
     joint_names: [.*]
     scale: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
-    #offset: [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]
-    offset: [-0.03584312,  0.6307912,  -1.4495131,   0.04133042,  0.7432153,  -1.2860187, -0.04333423,  0.9148848,  -1.4448581,   0.06747473, 0.8515197,  -1.5170943 ]
+    # 这里的 offset 必须与训练时的 Go2 policy 零点一致，用于 joint_pos_rel 重建和 action 解码。
+    offset: [0.8, -1.5, 0.1, -0.1, 0.8, -1.5, 0.1, 1.0, -1.5, -1.5, -0.1, 1.0]
     joint_ids: null
 observations:
   base_ang_vel:

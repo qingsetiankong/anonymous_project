@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import torch
 
 
 def _to_numpy(value: Any, dtype=np.float32) -> np.ndarray:
@@ -19,6 +20,16 @@ def _to_numpy(value: Any, dtype=np.float32) -> np.ndarray:
     if hasattr(value, "cpu"):
         value = value.cpu()
     return np.asarray(value, dtype=dtype)
+
+
+def _to_tensor(value: Any, device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    if torch.is_tensor(value):
+        if device is None:
+            return value.to(dtype=dtype)
+        return value.to(device=device, dtype=dtype)
+    if device is None:
+        return torch.as_tensor(value, dtype=dtype)
+    return torch.as_tensor(value, dtype=dtype, device=device)
 
 
 @dataclass
@@ -177,6 +188,55 @@ class SILBuffer:
             metadata=metadata,
         )
 
+    def add_episode_tensor(
+        self,
+        episode: dict[str, Any],
+        assessment_score: float,
+        skill_id: int | None = None,
+        imitation_key: str = "imitation_obs",
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        """
+        从 tensor 版 episode 字典中提取信息并加入 buffer。
+
+        这条路径尽量保持与 `add_episode()` 相同的逻辑，只是避免逐元素列表展开。
+        """
+        if imitation_key not in episode:
+            raise KeyError(f"episode 中缺少 imitation 序列字段: {imitation_key}")
+
+        if skill_id is None:
+            skill_tensor = episode.get("skill_ids")
+            if skill_tensor is None or int(_to_tensor(skill_tensor, dtype=torch.long).numel()) == 0:
+                raise KeyError("无法从 episode 中推断 skill_id，请显式传入")
+            skill_id = int(_to_tensor(skill_tensor, dtype=torch.long).reshape(-1)[0].item())
+
+        imitation_tensor = _to_tensor(episode[imitation_key], dtype=torch.float32)
+        if imitation_tensor.ndim != 2:
+            raise ValueError("imitation_obs tensor 必须是二维张量，shape 应为 [T, imitation_obs_dim]")
+        imitation_observations = imitation_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+
+        command_onehots = None
+        command_tensor = episode.get("command_onehots")
+        if command_tensor is not None and int(_to_tensor(command_tensor, dtype=torch.float32).numel()) > 0:
+            command_onehot_tensor = _to_tensor(command_tensor, dtype=torch.float32)
+            if command_onehot_tensor.ndim != 2:
+                raise ValueError("command_onehots tensor 必须是二维张量，shape 应为 [T, command_dim]")
+            if command_onehot_tensor.shape[0] != imitation_tensor.shape[0]:
+                raise ValueError(
+                    "command_onehots 与 imitation_observations 的时间长度必须一致，"
+                    f"实际得到 {command_onehot_tensor.shape[0]} 和 {imitation_tensor.shape[0]}"
+                )
+            command_onehots = command_onehot_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+
+        return self.add(
+            skill_id=skill_id,
+            imitation_observations=imitation_observations,
+            command_onehots=command_onehots,
+            assessment_score=assessment_score,
+            trajectory=episode,
+            metadata=metadata,
+        )
+
     def all_entries(self) -> list[SILTrajectory]:
         """
         返回所有 skill 桶中的轨迹条目列表。
@@ -185,6 +245,23 @@ class SILBuffer:
         for bucket in self._storage.values():
             entries.extend(bucket)
         return entries
+
+    def num_transition_samples(self, skill_id: int | None = None) -> int:
+        """
+        返回当前 buffer 中可用于 transition 判别器训练的相邻样本对数量。
+
+        约定:
+        - 仅统计 `length >= 2` 且包含 `command_onehots` 的轨迹
+        - 每条长度为 `T` 的轨迹可提供 `T - 1` 个相邻 transition
+        """
+        entries = self._storage.get(int(skill_id), []) if skill_id is not None else self.all_entries()
+        return int(
+            sum(
+                max(int(entry.length) - 1, 0)
+                for entry in entries
+                if entry.command_onehots is not None and int(entry.length) >= 2
+            )
+        )
 
     def sample(self, batch_size: int, skill_id: int | None = None) -> np.ndarray:
         """
@@ -279,6 +356,59 @@ class SILBuffer:
             np.asarray(curr_imitation_samples, dtype=np.float32),
             np.asarray(prev_command_samples, dtype=np.float32),
             np.asarray(curr_command_samples, dtype=np.float32),
+        )
+
+    def sample_transition_conditioned_torch(
+        self,
+        batch_size: int,
+        device: torch.device | str,
+        skill_id: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        从 buffer 中采样相邻时刻的 transition 条件样本的 torch 版本。
+
+        逻辑与 `sample_transition_conditioned()` 保持一致：
+        - 只使用 `length >= 2` 且包含 `command_onehots` 的轨迹
+        - 采样池是所有相邻 transition 的并集
+        """
+        target_device = torch.device(device)
+        entries = self._storage.get(int(skill_id), []) if skill_id is not None else self.all_entries()
+        entries = [
+            entry
+            for entry in entries
+            if entry.length >= 2 and entry.command_onehots is not None
+        ]
+        if not entries:
+            raise ValueError("SILBuffer 中没有可用于 transition 判别器采样的轨迹")
+
+        prev_imitation_chunks = []
+        curr_imitation_chunks = []
+        prev_command_chunks = []
+        curr_command_chunks = []
+        for entry in entries:
+            imitation_tensor = _to_tensor(entry.imitation_observations, device=target_device, dtype=torch.float32)
+            command_tensor = _to_tensor(entry.command_onehots, device=target_device, dtype=torch.float32)
+            prev_imitation_chunks.append(imitation_tensor[:-1])
+            curr_imitation_chunks.append(imitation_tensor[1:])
+            prev_command_chunks.append(command_tensor[:-1])
+            curr_command_chunks.append(command_tensor[1:])
+
+        prev_imitation_pool = torch.cat(prev_imitation_chunks, dim=0)
+        curr_imitation_pool = torch.cat(curr_imitation_chunks, dim=0)
+        prev_command_pool = torch.cat(prev_command_chunks, dim=0)
+        curr_command_pool = torch.cat(curr_command_chunks, dim=0)
+
+        total_transitions = int(prev_imitation_pool.shape[0])
+        if total_transitions <= 0:
+            raise ValueError("SILBuffer 中没有可用于 transition 判别器采样的相邻样本")
+
+        sample_indices_np = self._rng.integers(total_transitions, size=int(batch_size))
+        sample_indices = torch.as_tensor(sample_indices_np, dtype=torch.long, device=target_device)
+        return (
+            prev_imitation_pool[sample_indices],
+            curr_imitation_pool[sample_indices],
+            prev_command_pool[sample_indices],
+            curr_command_pool[sample_indices],
         )
 
     def summary(self) -> dict[int, dict[str, float]]:

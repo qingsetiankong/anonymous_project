@@ -124,7 +124,9 @@ class IsaacLabPasistEnv(BasePasistEnv):
         self._num_envs = int(self._unwrapped.num_envs)
         self._device = str(self._unwrapped.device)
         self._base_obs_dim = self._infer_base_obs_dim()
+        self._base_critic_obs_dim = self._infer_base_critic_obs_dim()
         self._obs_dim = self._base_obs_dim + self.command_dim
+        self._critic_obs_dim = self._base_critic_obs_dim + self.command_dim
         self._action_dim = self._infer_action_dim()
         self._imitation_obs_dim = self._infer_imitation_obs_dim()
 
@@ -135,6 +137,11 @@ class IsaacLabPasistEnv(BasePasistEnv):
     def obs_dim(self) -> int:
         """返回单个环境的 policy observation 维度。"""
         return self._obs_dim
+
+    @property
+    def critic_obs_dim(self) -> int:
+        """返回单个环境的 critic observation 维度。"""
+        return self._critic_obs_dim
 
     @property
     def action_dim(self) -> int:
@@ -203,8 +210,9 @@ class IsaacLabPasistEnv(BasePasistEnv):
 
         raw_policy_obs = self._extract_policy_observation(raw_obs)
         policy_obs = self._augment_policy_observation_with_command(raw_policy_obs, command)
-        critic_obs = self._extract_critic_observation(raw_obs)
-        measured_velocity = self._extract_measured_velocity(critic_obs)
+        raw_critic_obs = self._extract_critic_observation(raw_obs)
+        critic_obs = self._augment_critic_observation_with_command(raw_critic_obs, command)
+        measured_velocity = self._extract_measured_velocity(raw_critic_obs)
         base_height = self._extract_base_height()
         base_pitch = self._extract_base_pitch()
         imitation_obs = self.extract_imitation_observation(policy_obs)
@@ -251,11 +259,12 @@ class IsaacLabPasistEnv(BasePasistEnv):
         active_command = self._current_command or self.sample_command(skill_id=self._default_skill_id)
         raw_policy_obs = self._extract_policy_observation(raw_obs)
         policy_obs = self._augment_policy_observation_with_command(raw_policy_obs, active_command)
-        critic_obs = self._extract_critic_observation(raw_obs)
+        raw_critic_obs = self._extract_critic_observation(raw_obs)
+        critic_obs = self._augment_critic_observation_with_command(raw_critic_obs, active_command)
         reward = self._tensor_to_numpy(raw_reward)
         terminated = self._tensor_to_numpy(raw_terminated).astype(bool)
         truncated = self._tensor_to_numpy(raw_truncated).astype(bool)
-        measured_velocity = self._extract_measured_velocity(critic_obs)
+        measured_velocity = self._extract_measured_velocity(raw_critic_obs)
         base_height = self._extract_base_height()
         base_pitch = self._extract_base_pitch()
         imitation_obs = self.extract_imitation_observation(policy_obs)
@@ -447,6 +456,14 @@ class IsaacLabPasistEnv(BasePasistEnv):
             return int(policy_space.shape[-1])
         return int(obs_space.shape[-1])
 
+    def _infer_base_critic_obs_dim(self) -> int:
+        """从 observation_space 推断原始 critic observation 维度。没有时回退到 policy。"""
+        obs_space = self._env.observation_space
+        if hasattr(obs_space, "spaces") and self._critic_obs_key in obs_space.spaces:
+            critic_space = obs_space.spaces[self._critic_obs_key]
+            return int(critic_space.shape[-1])
+        return self._base_obs_dim
+
     def _infer_action_dim(self) -> int:
         """从 action_manager 或 action_space 推断单环境动作维度。"""
         action_dim = getattr(self._unwrapped.action_manager, "total_action_dim", None)
@@ -573,17 +590,41 @@ class IsaacLabPasistEnv(BasePasistEnv):
         policy_obs: np.ndarray,
         command: PasistCommand,
     ) -> np.ndarray:
-        """
-        在原始 policy observation 末尾拼接技能 one-hot command。
+        return self._augment_observation_with_command(
+            observation=policy_obs,
+            command=command,
+            observation_name="policy observation",
+        )
 
-        这样 actor 输入会从原来的 45 维扩展为 49 维，
+    def _augment_critic_observation_with_command(
+        self,
+        critic_obs: np.ndarray,
+        command: PasistCommand,
+    ) -> np.ndarray:
+        return self._augment_observation_with_command(
+            observation=critic_obs,
+            command=command,
+            observation_name="critic observation",
+        )
+
+    def _augment_observation_with_command(
+        self,
+        observation: np.ndarray,
+        command: PasistCommand,
+        observation_name: str,
+    ) -> np.ndarray:
+        """
+        在原始 observation 末尾拼接技能 one-hot command。
+
+        这样 actor / critic 都能显式拿到离散 skill command，
         且 skill command 的真来源统一为环境侧的 `PasistCommand.one_hot`。
         """
-        obs = np.asarray(policy_obs, dtype=np.float32)
+        obs = np.asarray(observation, dtype=np.float32)
         command_one_hot = np.asarray(command.one_hot, dtype=np.float32).reshape(-1)
         if command_one_hot.shape[0] != self.command_dim:
             raise ValueError(
-                f"command one-hot 维度不正确：期望 {self.command_dim}，实际得到 {command_one_hot.shape[0]}"
+                f"{observation_name} 拼接的 command one-hot 维度不正确："
+                f"期望 {self.command_dim}，实际得到 {command_one_hot.shape[0]}"
             )
 
         if obs.ndim == 1:

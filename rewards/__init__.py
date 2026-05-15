@@ -8,7 +8,13 @@ from rewards.regularization_reward import (
     roll_pitch_rate_penalty,
     yaw_rate_penalty,
 )
-from rewards.sil_reward import compute_mean_sil_dtw, compute_sil_reward, compute_sil_weight
+from rewards.sil_reward import (
+    compute_mean_sil_dtw,
+    compute_sil_confidence_weight,
+    compute_sil_reward,
+    compute_sil_warmup_weight,
+    compute_sil_weight,
+)
 from rewards.task_reward import (
     command_consistency_reward,
     compute_task_reward,
@@ -22,9 +28,11 @@ __all__ = [
     "action_smoothness_penalty",
     "command_consistency_reward",
     "compute_mean_sil_dtw",
+    "compute_sil_confidence_weight",
     "compute_regularization_reward",
     "compute_reward_terms",
     "compute_sil_reward",
+    "compute_sil_warmup_weight",
     "compute_sil_weight",
     "compute_task_reward",
     "compute_task_weight",

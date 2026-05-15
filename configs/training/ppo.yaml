@@ -1,15 +1,15 @@
 ppo:
-  num_steps: 128 #int
+  num_steps: 32 #int
   ppo_epochs: 4 #int
-  mini_batch_size: 256 #int
+  mini_batch_size: 32768 #int
   clip_epsilon: 0.2 #float
   gamma: 0.99 #float
   gae_lambda: 0.95 #float
   actor_lr: 3.0e-4 #float
-  critic_lr: 5e-3 #float
+  critic_lr: 5.0e-4 #float
   max_grad_norm: 1.0 #float
-  value_loss_coef: 0.5 #float
-  entropy_coef: 0.002 #float
+  value_loss_coef: 0.25 #float
+  entropy_coef: 0.005 #float
   device: "cpu" #str
 
   # policy / value 网络结构
@@ -25,13 +25,29 @@ ppo:
   enable_sil: True #bool
   use_skill_selector: True #bool
   discriminator_config_path: "configs/training/discriminator.yaml" #str
-  discriminator_batch_size: 256 #int
-  discriminator_updates_per_iteration: 1 #int
-  sil_buffer_capacity_per_skill: 16 #int
-  trajectory_dtw_weight: 0.1 #float
+  discriminator_batch_size: 512 #int
+  # SIL buffer 中至少积累多少条 expert 轨迹后，才开始训练判别器。
+  min_sil_buffer_trajectories_for_discriminator: 20 #int
+  # discriminator_updates_per_iteration: 4 #int
+  discriminator_max_updates_per_iteration: 4 #int
+  discriminator_min_updates_per_iteration: 1 #int
+  discriminator_adaptive_updates: true #bool
+  sil_buffer_capacity_per_skill: 128 #int
+  trajectory_dtw_weight: 1 #float
   # 下面三项默认值与当前代码行为保持一致，仅用于后续调参时开放配置接口。
   trajectory_reference_length_ratio: 0.5 #float
   trajectory_normalize_dtw: true #bool
+  # 用固定 horizon 缩放累计 task reward，使其和已归一化的 DTW 更接近同一量级。
+  trajectory_task_reward_normalization_length: 32 #float
+  # 每隔多少个 iteration 才执行一次完整的 SIL / DTW / discriminator 更新。
+  sil_update_interval: 1 #int
+  # 优先只对完整 episode 做 trajectory evaluation，减少 DTW 量并避免半截片段噪声。
+  sil_use_completed_episodes_only: true #bool
+  
+  # 新增的高吞吐训练路径，默认关闭，逐项可切换。
+  use_tensor_env_api: true #bool
+  use_torch_reward_stack: true #bool
+  use_lightweight_tensor_info: true #bool
   trajectory_dtw_feature_slices:
     - [0, 13] # 只比较前 13 维：base_height + joint_pos_rel
 

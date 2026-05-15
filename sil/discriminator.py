@@ -276,7 +276,7 @@ class SILDiscriminator(nn.Module):
         scores = self.backbone(observations)
         return scores.squeeze(-1)
 
-    def sil_reward(self, policy_samples: torch.Tensor) -> torch.Tensor:
+    def sil_reward(self, policy_samples: torch.Tensor, positive_margin: float = 0.0) -> torch.Tensor:
         """
         根据当前 policy 样本计算 SIL 奖励。
 
@@ -291,7 +291,7 @@ class SILDiscriminator(nn.Module):
           值域由 `compute_sil_reward()` 约束在 `[0, 1]`
         """
         scores = self.forward(policy_samples)
-        return compute_sil_reward(scores)
+        return compute_sil_reward(scores, positive_margin=positive_margin)
 
     def gradient_penalty(self, expert_samples: torch.Tensor) -> torch.Tensor:
         """

@@ -1,14 +1,12 @@
+from __future__ import annotations
+
 import os
 
-import gymnasium as gym
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-
-from rl import rl_utils
 
 
 def resolve_activation(activation_name: str | None):
@@ -224,6 +222,22 @@ def load_config(config_path):
     return config
 
 def test_train():
+    try:
+        import gymnasium as gym
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "test_train() 需要 gymnasium；PASIST PPO 训练只使用本文件中的 MLP，"
+            "不需要安装 gymnasium。"
+        ) from exc
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        raise RuntimeError("test_train() 需要可用的 matplotlib；PASIST PPO 训练不需要 matplotlib。") from exc
+    try:
+        from rl import rl_utils
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("test_train() 需要 rl_utils 依赖；PASIST PPO 训练不需要它。") from exc
+
     config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "training", "ac.yaml")
     config = load_config(config_path)
 

@@ -74,6 +74,17 @@ class BasePasistEnv(ABC):
         raise NotImplementedError
 
     @property
+    def critic_obs_dim(self) -> int:
+        """
+        返回 value / critic 使用的观测维度。
+
+        默认与 `obs_dim` 相同，即 actor 和 critic 共享同一套观测。
+        如果具体环境支持 asymmetric actor-critic，可以覆盖这个属性，
+        让 critic 看到比 policy 更多的状态信息。
+        """
+        return self.obs_dim
+
+    @property
     @abstractmethod
     def action_dim(self) -> int:
         """
@@ -169,6 +180,7 @@ class BasePasistEnv(ABC):
           shape = [obs_dim] 的初始观测
         - info:
           附加信息字典。建议至少包含：
+          - "critic_obs"
           - "command"
           - "skill_id"
           - "target_pose"
@@ -202,6 +214,7 @@ class BasePasistEnv(ABC):
           时间截断标志，例如超过 episode 最大步数
         - info:
           建议至少包含：
+          - "critic_obs"
           - "command"
           - "skill_id"
           - "target_pose"

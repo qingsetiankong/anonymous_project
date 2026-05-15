@@ -18,9 +18,15 @@ def _add_project_root_to_path() -> pathlib.Path:
 
 
 PROJECT_ROOT = _add_project_root_to_path()
-print(PROJECT_ROOT)
 
 from rl.ppo_trainer import GaussianPolicy  # noqa: E402
+
+
+def _torch_load_checkpoint(checkpoint_path: pathlib.Path, device: torch.device):
+    try:
+        return torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(checkpoint_path, map_location=device)
 
 
 class DeterministicDeployPolicy(nn.Module):
@@ -66,6 +72,21 @@ def _find_policy_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
     raise KeyError("未在 checkpoint 中找到可用的 policy_state_dict")
 
 
+def _resolve_actor_activation(checkpoint: object) -> str:
+    """
+    优先从 checkpoint 中恢复训练时使用的 actor 激活函数。
+
+    如果老 checkpoint 没有保存 config，则回退到 `relu`，以兼容历史导出逻辑。
+    """
+    if isinstance(checkpoint, dict):
+        config = checkpoint.get("config")
+        if isinstance(config, dict):
+            activation = config.get("actor_activation")
+            if activation:
+                return str(activation)
+    return "relu"
+
+
 def _infer_policy_architecture(state_dict: dict[str, torch.Tensor]) -> tuple[int, tuple[int, ...], int]:
     """
     根据 `mean_net.layers.*.weight` 自动恢复 actor 网络结构。
@@ -96,23 +117,33 @@ def _infer_policy_architecture(state_dict: dict[str, torch.Tensor]) -> tuple[int
 def _load_policy_from_checkpoint(
     checkpoint_path: pathlib.Path,
     device: torch.device,
-) -> tuple[GaussianPolicy, int, tuple[int, ...], int]:
+) -> tuple[GaussianPolicy, int, tuple[int, ...], int, str]:
     """
     从训练好的 checkpoint 中恢复 `GaussianPolicy`。
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = _torch_load_checkpoint(checkpoint_path=checkpoint_path, device=device)
     state_dict = _find_policy_state_dict(checkpoint)
     obs_dim, hidden_dims, action_dim = _infer_policy_architecture(state_dict)
+    actor_activation = _resolve_actor_activation(checkpoint)
 
     policy = GaussianPolicy(
         obs_dim=obs_dim,
         action_dim=action_dim,
         hidden_dims=hidden_dims,
         init_log_std=-0.5,  # load_state_dict 后会被 checkpoint 中真实参数覆盖
+        hidden_activation=actor_activation,
     ).to(device)
     policy.load_state_dict(state_dict)
     policy.eval()
-    return policy, obs_dim, hidden_dims, action_dim
+    return policy, obs_dim, hidden_dims, action_dim, actor_activation
+
+
+def load_policy_from_checkpoint(
+    checkpoint_path: pathlib.Path,
+    device: torch.device,
+) -> tuple[GaussianPolicy, int, tuple[int, ...], int, str]:
+    """公开的 checkpoint 策略恢复接口，供导出和 play 共用。"""
+    return _load_policy_from_checkpoint(checkpoint_path=checkpoint_path, device=device)
 
 
 def _format_hidden_dims(hidden_dims: Iterable[int]) -> str:
@@ -137,7 +168,7 @@ def export_onnx_policy(
     - 不包含 obs normalizer，因为当前项目训练链本身没有启用 obs normalization
     """
     torch_device = torch.device(device)
-    policy, obs_dim, hidden_dims, action_dim = _load_policy_from_checkpoint(
+    policy, obs_dim, hidden_dims, action_dim, actor_activation = load_policy_from_checkpoint(
         checkpoint_path=checkpoint_path,
         device=torch_device,
     )
@@ -169,6 +200,7 @@ def export_onnx_policy(
     print(f"obs_dim: {obs_dim}")
     print(f"action_dim: {action_dim}")
     print(f"hidden_dims: {_format_hidden_dims(hidden_dims)}")
+    print(f"actor_activation: {actor_activation}")
     print(f"opset_version: {opset_version}")
     print("[INFO] Exported deterministic actor: actions = mean_net(observations)")
     return output_path

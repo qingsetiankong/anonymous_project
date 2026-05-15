@@ -4,17 +4,21 @@ import numpy as np
 import torch
 
 
-def compute_sil_reward(discriminator_scores: torch.Tensor) -> torch.Tensor:
+def compute_sil_reward(
+    discriminator_scores: torch.Tensor,
+    positive_margin: float = 0.0,
+) -> torch.Tensor:
     """
     根据判别器分数计算 SIL 奖励。
 
-    对应论文 Eq. (3):
-    r_SIL = max(0, 1 - 0.25 * (D(x) - 1)^2)
+    当前实现采用单边阈值化形式：
+
+    r_SIL = clamp((D(x) - positive_margin) / (1 - positive_margin), 0, 1)
 
     设计直觉:
-    - 当判别器认为当前 policy 样本更像 SIL buffer 中的高质量样本时，
-      D(x) 会更接近 1，此时奖励更高
-    - 奖励被截断在 [0, 1] 范围内，便于和其他奖励项组合
+    - 只有当判别器明确给出“更像 expert”的正分数时，SIL 才开始生效
+    - `positive_margin > 0` 时，可以进一步抑制 `D(x) ≈ 0` 的模糊区奖励
+    - 奖励仍然被约束在 `[0, 1]`，便于和其他奖励项组合
 
     参数:
     - `discriminator_scores`:
@@ -27,26 +31,34 @@ def compute_sil_reward(discriminator_scores: torch.Tensor) -> torch.Tensor:
     - `torch.Tensor`
       shape 与输入广播兼容，值域约束在 `[0, 1]`
     """
-    return torch.clamp(1.0 - 0.25 * (discriminator_scores - 1.0) ** 2, min=0.0, max=1.0)
+    margin = float(positive_margin)
+    denom = max(1.0 - margin, 1.0e-6)
+    normalized = (discriminator_scores - margin) / denom
+    return torch.clamp(normalized, min=0.0, max=1.0)
 
 
-def compute_sil_weight(mean_dtw_distance: float, sigma_sil: float, num_skills: int) -> float:
+def compute_sil_weight(
+    mean_dtw_distance: float,
+    sigma_sil: float,
+    num_skills: int,
+    dtw_decay_rate: float = 1.0,
+) -> float:
     """
     根据 DTW 统计值计算 SIL 奖励权重 omega_SIL。
 
-    按 PASIST 原文 Eq. (7) 的含义实现：
+    当前实现采用单调降权形式：
 
-    omega_SIL = exp(-|mean_dtw_distance - sigma_sil|)
+    omega_SIL = exp(-dtw_decay_rate * max(mean_dtw_distance - sigma_sil, 0))
 
     这里的 `mean_dtw_distance` 约定为：
     - 已经对所有 skill 做过平均的全局 DTW 统计
-    - 也就是等价于论文中的 `(1 / N_m) * sum_p E[dDTW(...)]`
+    - 也就是等价于论文中的 `(1 / N_m) * sum_p E[dDTW(...)]` 的工程聚合值
 
     说明:
-    - 原文这里同样是范数/绝对值形式
-    - 对当前标量 mean DTW 的工程实现，等价使用
-      `abs(mean_dtw_distance - sigma_sil)`
-    - 因此 `omega_SIL` 会稳定落在 `(0, 1]`
+    - 当 `mean_dtw_distance <= sigma_sil` 时，说明 buffer 质量已达到目标阈值，
+      此时不额外降权，返回 1.0
+    - 当 `mean_dtw_distance > sigma_sil` 时，距离越差，衰减越快
+    - `dtw_decay_rate` 控制衰减速度，越大越严格
 
     因此，虽然函数签名中仍然保留 `num_skills` 参数以兼容现有调用链，
     但当前实现不会再次除以 `num_skills`，避免重复平均。
@@ -71,7 +83,58 @@ def compute_sil_weight(mean_dtw_distance: float, sigma_sil: float, num_skills: i
     if not np.isfinite(float(mean_dtw_distance)):
         return 0.0
     del num_skills
-    return float(np.exp(-abs(float(mean_dtw_distance) - float(sigma_sil))))
+    excess_distance = max(float(mean_dtw_distance) - float(sigma_sil), 0.0)
+    return float(np.exp(-float(dtw_decay_rate) * excess_distance))
+
+
+def compute_sil_confidence_weight(
+    score_margin: float,
+    min_margin: float,
+    max_margin: float,
+) -> float:
+    """
+    根据判别器 expert-policy 分离度计算置信度权重。
+
+    线性门控形式：
+
+    omega_conf = clip((score_margin - min_margin) / (max_margin - min_margin), 0, 1)
+
+    其中：
+    - `score_margin = mean(D_expert) - mean(D_policy)`
+    - 当 margin 小于 `min_margin`，视为判别器分离度不足，返回 0
+    - 当 margin 大于 `max_margin`，视为判别器分离度足够，返回 1
+    """
+    min_margin_value = float(min_margin)
+    max_margin_value = float(max_margin)
+    if max_margin_value <= min_margin_value:
+        return float(1.0 if float(score_margin) >= max_margin_value else 0.0)
+    normalized = (float(score_margin) - min_margin_value) / (max_margin_value - min_margin_value)
+    return float(np.clip(normalized, 0.0, 1.0))
+
+
+def compute_sil_warmup_weight(
+    expert_trajectory_count: int,
+    warmup_start: int,
+    warmup_trajectories: int,
+) -> float:
+    """
+    根据当前 expert 轨迹数计算 SIL warmup 权重。
+
+    形式：
+
+    omega_warmup = clip((count - warmup_start) / warmup_trajectories, 0, 1)
+
+    其中：
+    - `warmup_start` 通常取判别器开始训练的最小 buffer 条数
+    - `warmup_trajectories` 控制从“刚能训练”到“完全放开”还需要新增多少条 expert
+    """
+    count = int(max(expert_trajectory_count, 0))
+    start = int(max(warmup_start, 0))
+    span = int(max(warmup_trajectories, 0))
+    if span <= 0:
+        return float(1.0 if count >= start else 0.0)
+    normalized = (count - start) / float(span)
+    return float(np.clip(normalized, 0.0, 1.0))
 
 
 def compute_mean_sil_dtw(summary_by_skill: dict[int, dict[str, float]]) -> float:

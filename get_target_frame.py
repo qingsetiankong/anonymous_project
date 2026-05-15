@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from go2_joint_order import GO2_JOINT_ORDER
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -14,22 +16,6 @@ DEFAULT_INIT_OUTPUT_NPY = PROJECT_ROOT / "init_pose" / "init_pose.npy"
 DEFAULT_INIT_OUTPUT_NPZ = PROJECT_ROOT / "init_pose" / "generated_init_pose.npz"
 DEFAULT_TARGET_OUTPUT_NPY = PROJECT_ROOT / "target_pose_bank" / "target_pose_bank.npy"
 DEFAULT_TARGET_OUTPUT_NPZ = PROJECT_ROOT / "target_pose_bank" / "generated_target_pose.npz"
-
-# 顺序与工程中的 GO2_JOINT_ORDER 一致：FR -> FL -> RR -> RL，每条腿依次 hip / thigh / calf。
-GO2_JOINT_ORDER: tuple[str, ...] = (
-    "FR_hip_joint",
-    "FR_thigh_joint",
-    "FR_calf_joint",
-    "FL_hip_joint",
-    "FL_thigh_joint",
-    "FL_calf_joint",
-    "RR_hip_joint",
-    "RR_thigh_joint",
-    "RR_calf_joint",
-    "RL_hip_joint",
-    "RL_thigh_joint",
-    "RL_calf_joint",
-)
 
 # IsaacLab / 本工程默认的 Go2 nominal joint pose。
 DEFAULT_JOINT_POS = np.array(
